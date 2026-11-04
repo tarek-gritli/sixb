@@ -65,6 +65,15 @@ const lakeStorage = new DuckLakeStorage({
 Use `close()` during service shutdown so DuckDB can close its runtime and release
 catalog connections cleanly.
 
+### Pinned DuckDB and DuckLake builds
+
+`@duckdb/node-api` is pinned to an exact version (DuckDB 1.5.6), and the provider refuses to
+attach with any DuckLake extension build but `ac7595b0`. DuckDB's extension repository serves one
+build per DuckDB version and can replace it, so without the check a deploy would run whatever
+build it downloaded that day. A runtime that loads another build fails before attaching, naming
+both builds. Keep the tested build in the image's DuckDB extension directory
+(`duckdb.config.extension_directory`) to make deploys independent of the repository.
+
 ### Maintenance
 
 DuckLake keeps historical snapshots and deleted files until maintenance runs.
