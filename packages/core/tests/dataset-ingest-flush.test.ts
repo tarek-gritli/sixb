@@ -21,6 +21,7 @@ import { buildEventSelectorPredicate } from "../src/events"
 import { createTestingScope } from "../src/execution/scopes"
 import { LakeStorageError } from "../src/lake-storage/errors"
 import { DatasetIngestFlushError, getDatasetIngestRuntime } from "../src/runtime/internal"
+import { InMemoryDatasetIngestStorage } from "../src/storage"
 
 const people = defineDataset("source.people", {
   schema: [col("id", "string"), col("revision", "int64"), col("name", "string")],
@@ -75,6 +76,9 @@ class RefusingLakeStorage extends InMemoryLakeStorage {
 
 function setup(lakeStorage = new InMemoryLakeStorage()) {
   const storage = new InMemoryStorage()
+  // The inbox alone, outside the storage's operation lock: a test can pause one of its calls
+  // without holding every other storage call behind it.
+  Object.defineProperty(storage, "datasetIngest", { value: new InMemoryDatasetIngestStorage() })
   const blobStorage = new InMemoryBlobStorage()
   const broker = new InMemoryBroker()
   const reports: SixbErrorContext[] = []
@@ -512,6 +516,95 @@ test("a flush whose lease expired commits nothing twice when it wakes", async ()
   ])
 })
 
+test("a flush paused before it writes stops when another resumed its batch meanwhile", async () => {
+  // Regression proof: drop \`assertOwned\` from \`commit\`; the paused flush writes the batch a
+  // second time on top of the other's version.
+  jest.useFakeTimers()
+  const { storage, ingest, flush, lakeStorage } = setup()
+  await ingest(contacts, change.upsert({ id: "1", name: "Ada" }))
+
+  // The first flush pauses once it has taken its batch.
+  const paused = Promise.withResolvers<void>()
+  const wake = Promise.withResolvers<void>()
+  const takeBatch = storage.datasetIngest.takeBatch.bind(storage.datasetIngest)
+  let takes = 0
+  storage.datasetIngest.takeBatch = async (input) => {
+    const batch = await takeBatch(input)
+    takes += 1
+    if (takes === 1) {
+      paused.resolve()
+      await wake.promise
+    }
+    return batch
+  }
+
+  const sleeper = flush(contacts).catch((error) => error)
+  await paused.promise
+
+  // Its lease expires. Another flush resumes the batch and writes it, but has not deleted it yet.
+  jest.setSystemTime(new Date(Date.now() + 61_000))
+  const written = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const complete = storage.datasetIngest.complete.bind(storage.datasetIngest)
+  storage.datasetIngest.complete = async (input) => {
+    written.resolve()
+    await release.promise
+    return complete(input)
+  }
+  const other = flush(contacts)
+  await written.promise
+
+  wake.resolve()
+  expect(((await sleeper) as Error).name).toBe("DatasetIngestLeaseLostError")
+
+  release.resolve()
+  expect(await other).toEqual({ kind: "flushed", versions: 1, deliveries: 1 })
+  expect(await lakeStorage.listVersions(contacts.id)).toHaveLength(1)
+})
+
+test("a flush that runs past its lease renews it, and stops when it loses it", async () => {
+  // Regression proof: drop the \`setInterval\` renewal from \`run\`; the second flush takes the
+  // dataset after 60 s. Drop the \`lost\` abort from \`renew\`; the flush that lost it writes.
+  jest.useFakeTimers()
+  const lakeStorage = new InMemoryLakeStorage()
+  const { storage, ingest, flush, host } = setup(lakeStorage)
+  await ingest(contacts, change.upsert({ id: "1", name: "Ada" }))
+
+  const writing = Promise.withResolvers<void>()
+  const finish = Promise.withResolvers<void>()
+  const beginMerge = lakeStorage.beginMerge.bind(lakeStorage)
+  lakeStorage.beginMerge = async (input) => {
+    writing.resolve()
+    await finish.promise
+    return beginMerge(input)
+  }
+
+  const running = flush(contacts).catch((error) => error)
+  await writing.promise
+
+  // A minute and a half of writing: the lease, renewed every 15 s, stays the first flush's.
+  for (let tick = 0; tick < 6; tick += 1) {
+    jest.advanceTimersByTime(15_000)
+    await turns()
+  }
+  const second = await storage.datasetIngest.acquire({
+    projectId: host.id,
+    datasetId: contacts.id,
+    owner: "another-worker",
+    leaseMs: 60_000,
+  })
+  expect(second.acquired).toBe(false)
+
+  // The lease is lost: the next renewal stops the flush before it writes.
+  storage.datasetIngest.renew = async () => null
+  jest.advanceTimersByTime(15_000)
+  await turns()
+  finish.resolve()
+
+  expect(((await running) as Error).name).toBe("DatasetIngestLeaseLostError")
+  expect(await lakeStorage.listVersions(contacts.id)).toEqual([])
+})
+
 test("a dataset whose flushes keep failing is reported once, at the fifth failure in a row", async () => {
   // Regression proof: report at every failure; six reports arrive.
   const lakeStorage = new InMemoryLakeStorage()
@@ -650,4 +743,9 @@ async function readAll(lakeStorage: InMemoryLakeStorage, dataset: DatasetDefinit
     all.push(row)
   }
   return all.sort((left, right) => String(left.id).localeCompare(String(right.id)))
+}
+
+/** Lets pending promise callbacks run: fake timers stop the clock a timeout would use. */
+async function turns(count = 20): Promise<void> {
+  for (let turn = 0; turn < count; turn += 1) await Promise.resolve()
 }

@@ -236,6 +236,8 @@ class DatasetIngestFlush {
       const producer = producerOf(oldest)
 
       try {
+        await this.assertOwned(lease)
+
         const result = await writeDataset({
           lakeStorage: this.dependencies.lakeStorage,
           blobStorage: this.dependencies.blobStorage,
@@ -496,6 +498,21 @@ class DatasetIngestFlush {
         ],
       },
       { source: "SixbDatasets" }
+    )
+  }
+
+  /**
+   * Stops a flush that lost its lease, right before it writes: a flush paused past its lease may
+   * find another one resumed its batch and wrote it. What remains is a pause longer than the lease
+   * between this check and the lake's commit; the commit then races the other flush's, which the
+   * lake's optimistic merge settles.
+   */
+  private async assertOwned(lease: DatasetIngestLease): Promise<void> {
+    const renewed = await this.inbox.renew({ lease, leaseMs: LEASE_MS })
+    if (renewed) return
+
+    throw new DatasetIngestLeaseLostError(
+      `[Sixb] Dataset '${this.datasetId}' ingest lease was taken over by another flush.`
     )
   }
 
