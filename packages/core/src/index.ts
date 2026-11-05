@@ -1014,6 +1014,7 @@ export type {
   SixbErrorHandler,
   SixbEventDeliveryFailedContext,
   SixbFailedRun,
+  SixbLakeRetentionFailedContext,
   SixbRuleEvaluationFailedContext,
   SixbRunFailedContext,
   SixbRunFailureByKind,
@@ -1044,6 +1045,7 @@ export type {
   OntologyOperationalStatus,
   SixbReadiness,
 } from "./maintenance"
+export type { LakeMaintenanceOptions } from "./maintenance/lake-retention"
 export type {
   LanguageModel,
   LanguageModelDefinition,

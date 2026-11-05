@@ -12,6 +12,14 @@ export type {
 } from "../connectors/connections/contracts"
 export type { ConnectorConnectionsRuntime } from "../connectors/connections/execution"
 export type { AuthorizedObjectReader } from "../execution/authorized-object-reader"
+export type {
+  LakeMaintenanceSettings,
+  LakeRetentionRuntime,
+} from "../maintenance/lake-retention"
+export {
+  getLakeRetentionRuntime,
+  LAKE_RETENTION_SCHEDULE_ID,
+} from "../maintenance/lake-retention"
 export { VectorIndexingDeferred } from "../objects/vectors/indexing"
 export type { VectorIndexingRuntime } from "../objects/vectors/indexing-runtime"
 export { getVectorIndexingRuntime } from "../objects/vectors/indexing-runtime"
