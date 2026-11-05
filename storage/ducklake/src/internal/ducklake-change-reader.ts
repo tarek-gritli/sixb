@@ -83,7 +83,7 @@ export class DuckLakeChangeReader {
       const rowCounts =
         feed !== null && (await this.compareFeed(runtime, temporary, feed, input, columns))
           ? { from: feed.fromRowCount, to: feed.toRowCount }
-          : await this.compareVersions(runtime, temporary, ref, input, columns)
+          : await this.compareVersions(runtime, temporary, ref, input, columns, [before, after])
       if (rowCounts === null) return null
       created = true
 
@@ -143,21 +143,32 @@ export class DuckLakeChangeReader {
 
   /**
    * Writes the delta into `temporary` by joining both versions in full. Null, writing nothing,
-   * when the identity is not unique and nonblank in both.
+   * when the identity is not unique and nonblank in both. In versions too large to count their
+   * distinct keys at no cost (`FEED_MIN_ROWS`), a primary key both validated is unique already:
+   * only its blank values are looked for.
    */
   private async compareVersions(
     runtime: DuckDbQueryRuntime,
     temporary: string,
     table: DatasetTableRef,
     input: ReadDatasetChangesInput,
-    columns: readonly DatasetColumnDefinition[]
+    columns: readonly DatasetColumnDefinition[],
+    versions: readonly [DatasetVersion, DatasetVersion]
   ): Promise<{ readonly from: number; readonly to: number } | null> {
     const relation = qualifiedTableName(this.options, table.tableName)
     const oldRelation = `${relation} AT (VERSION => ${parseVersionId(input.fromVersionId)})`
     const newRelation = `${relation} AT (VERSION => ${parseVersionId(input.toVersionId)})`
 
-    const from = await uniqueRowCount(runtime, oldRelation, input.keyColumns)
-    const to = await uniqueRowCount(runtime, newRelation, input.keyColumns)
+    const [before, after] = versions
+    const small =
+      before.rowCount !== undefined &&
+      after.rowCount !== undefined &&
+      before.rowCount + after.rowCount < FEED_MIN_ROWS
+    const validated = !small && (await this.validatedOn(runtime, table, input))
+
+    const count = validated ? nonblankRowCount : uniqueRowCount
+    const from = await count(runtime, oldRelation, input.keyColumns)
+    const to = await count(runtime, newRelation, input.keyColumns)
     if (from === null || to === null) return null
     input.signal?.throwIfAborted()
 
@@ -170,6 +181,22 @@ export class DuckLakeChangeReader {
       )}`
     )
     return { from, to }
+  }
+
+  /** Whether both versions validated the identity as their primary key. */
+  private async validatedOn(
+    runtime: DuckDbQueryRuntime,
+    table: DatasetTableRef,
+    input: ReadDatasetChangesInput
+  ): Promise<boolean> {
+    for (const versionId of [input.fromVersionId, input.toVersionId]) {
+      const row = await this.snapshots.getSnapshotRow(runtime, table, parseVersionId(versionId))
+      if (row === null || !keyedOn(row, input.keyColumns)) {
+        return false
+      }
+    }
+
+    return true
   }
 
   /**
@@ -380,6 +407,17 @@ async function uniqueRowCount(
   return safeCount(row!, "unique_keys") === count && safeCount(row!, "invalid_keys") === 0
     ? count
     : null
+}
+
+/** The relation's row count, or null when a key is blank. */
+async function nonblankRowCount(
+  runtime: DuckDbQueryRuntime,
+  relation: string,
+  keys: readonly string[]
+): Promise<number | null> {
+  const [row] = await runtime.query(`SELECT count(*) AS total,
+    count(*) FILTER (WHERE ${invalidKeysSql(keys)}) AS invalid_keys FROM ${relation}`)
+  return safeCount(row!, "invalid_keys") === 0 ? safeCount(row!, "total") : null
 }
 
 function safeCount(row: Readonly<Record<string, unknown>>, name: string): number {

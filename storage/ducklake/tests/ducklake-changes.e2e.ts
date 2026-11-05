@@ -6,7 +6,7 @@ import { change, col, type DatasetRow, defineDataset } from "@sixb/core"
 import type { DatasetRowChange } from "@sixb/core/lake-storage"
 import { runLakeChangesContractSuite } from "@sixb/core/testing"
 import type { DuckLakeStorage } from "../src"
-import type { DuckDbExclusiveRuntime } from "../src/internal/duckdb-runtime"
+import type { DuckDbExclusiveRuntime, DuckDbRuntime } from "../src/internal/duckdb-runtime"
 import { encodeDatasetTableName } from "../src/internal/names"
 import { quoteIdentifier, quoteSqlString } from "../src/internal/sql"
 import { parseVersionId } from "../src/internal/versions"
@@ -31,6 +31,7 @@ interface ChangeReaderInternals {
     compareFeed(...args: unknown[]): Promise<boolean>
   }
   readonly connections: {
+    attachedRuntime(): Promise<DuckDbRuntime>
     withExclusiveAttached<T>(run: (runtime: DuckDbExclusiveRuntime) => Promise<T>): Promise<T>
   }
 }
@@ -165,6 +166,36 @@ describe("DuckLakeStorage changes from the change feed", () => {
     await byName?.close()
 
     expect(compareFeed).not.toHaveBeenCalled()
+  }, 60_000)
+
+  // Regression proof: in compareVersions, count distinct keys whatever the versions validated.
+  // The comparison, which a full replacement in between sends there, then runs the distinct count
+  // on both versions.
+  test("compares two large versions on their validated primary key without counting distinct keys", async () => {
+    const first = (await snapshot(seedRows)).versionId
+    await snapshot(seedRows.map((row) => ({ ...row, name: "replaced" })))
+    const last = (await snapshot(edited(seedRows, { rename: ["a1"] }))).versionId
+
+    const runtime = await internals(storage).connections.attachedRuntime()
+    const query = spyOn(runtime, "query")
+    try {
+      expect(await changesBetween(first, last)).toEqual(await expectedChanges(first, last))
+      expect(query.mock.calls.some(([sql]) => /count\(DISTINCT/i.test(String(sql)))).toBe(false)
+    } finally {
+      query.mockRestore()
+    }
+
+    // A blank key still refuses the change read, as for any identity.
+    const blank = (await snapshot([...seedRows, { id: " ", name: "blank", score: 0 }])).versionId
+    expect(
+      await storage.readChanges({
+        datasetId: accounts.id,
+        fromVersionId: last,
+        toVersionId: blank,
+        keyColumns: ["id"],
+        columns: ["id", "name"],
+      })
+    ).toBeNull()
   }, 60_000)
 
   async function snapshot(rows: readonly DatasetRow[]) {

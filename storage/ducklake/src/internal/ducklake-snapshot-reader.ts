@@ -859,6 +859,15 @@ export class DuckLakeSnapshotReader {
     return latest ?? null
   }
 
+  /** The snapshot row of one version, with its Sixb commit metadata, and without its parent. */
+  async getSnapshotRow(
+    runtime: DuckDbQueryRuntime,
+    tableRef: DatasetTableRef,
+    snapshotId: string
+  ): Promise<DatasetSnapshotRow | null> {
+    return this.getSnapshotRowForTableRef(runtime, tableRef, snapshotId, { includeParent: false })
+  }
+
   /**
    * The dataset's versions and the table's maintenance commits from one version to a later one,
    * or null when more than `limit` snapshots name the dataset's tables in between. It reads the
