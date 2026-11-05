@@ -8,6 +8,7 @@ import {
   ProjectionRunDispatcher,
 } from "@sixb/core/internal/projections"
 import {
+  getDatasetIngestRuntime,
   getLakeRetentionRuntime,
   LAKE_RETENTION_SCHEDULE_ID,
   setApiPublicOrigin,
@@ -189,6 +190,7 @@ export async function startOrchestratorRuntime(
     ...(getLakeRetentionRuntime(sixb).scheduled
       ? { lakeRetention: { scheduleId: LAKE_RETENTION_SCHEDULE_ID } }
       : {}),
+    datasetIngest: getDatasetIngestRuntime(sixb).enabled,
   })
   const warnings = diagnostics.map(formatRouteDiagnosticWarning)
   let orchestratorWorker: OrchestratorWorker | null = null
@@ -214,6 +216,9 @@ export async function startOrchestratorRuntime(
         workflows: new WorkflowRunDispatcher(sixb),
       },
       ...(projectionReconciliation ? { projectionReconciliation } : {}),
+      ...(sixb.storage.datasetIngest
+        ? { ingestReconciliation: { inbox: sixb.storage.datasetIngest, reporter: sixb } }
+        : {}),
     })
     await orchestratorWorker.start()
   }
