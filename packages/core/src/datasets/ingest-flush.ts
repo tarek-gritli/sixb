@@ -254,12 +254,7 @@ class DatasetIngestFlush {
           deliveries,
         }
       } catch (error) {
-        const refused =
-          error instanceof RefusedChange
-            ? error
-            : error instanceof DatasetSequenceConflictError
-              ? await this.findConflicting(dataset, lease, batch, error)
-              : null
+        const refused = await this.refusedChange(dataset, lease, batch, error)
 
         if (refused) {
           await this.reject(dataset, lease, batch, refused)
@@ -309,21 +304,39 @@ class DatasetIngestFlush {
     )
   }
 
-  /** The last change of the batch at the conflicting key and sequence: the one to refuse. */
+  /** The change a failed write refuses, if the failure names one. */
+  private async refusedChange(
+    dataset: DatasetDefinition,
+    lease: DatasetIngestLease,
+    batch: DatasetIngestBatch,
+    error: unknown
+  ): Promise<RefusedChange | null> {
+    if (error instanceof RefusedChange) return error
+    if (error instanceof DatasetSequenceConflictError) {
+      return this.findConflicting(dataset, lease, batch, error)
+    }
+    return null
+  }
+
+  /**
+   * The change the lake refused for a tie: the first one at its key and sequence with its content.
+   * An earlier change at that key, sequence and content would have been accepted, and the refused
+   * one with it.
+   */
   private async findConflicting(
     dataset: DatasetDefinition,
     lease: DatasetIngestLease,
     batch: DatasetIngestBatch,
     conflict: DatasetSequenceConflictError
   ): Promise<RefusedChange | null> {
-    let last: BatchValue | null = null
-
     for await (const value of this.values(lease, batch.flushId)) {
-      const { key, sequence } = datasetSequenceChange(dataset, value.value)
-      if (key === conflict.key && sequence === conflict.sequence) last = value
+      const { key, sequence, content } = datasetSequenceChange(dataset, value.value)
+      if (key === conflict.key && sequence === conflict.sequence && content === conflict.content) {
+        return new RefusedChange(value, conflict)
+      }
     }
 
-    return last && new RefusedChange(last, conflict)
+    return null
   }
 
   private async reject(

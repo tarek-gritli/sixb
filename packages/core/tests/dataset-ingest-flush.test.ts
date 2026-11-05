@@ -239,6 +239,33 @@ test("a delivery the lake refuses is reported with what to send again, and the r
   ])
 })
 
+test("a tie refuses the change that conflicts, not a resend of what the lake holds", async () => {
+  // Regression proof: in `findConflicting`, refuse the last change at the key and sequence
+  // instead of the first with the refused content; the resend is dropped, and Ada with it.
+  const { scope, ingest, flush, rows, reported } = setup()
+  await ingest(people, change.upsert({ id: "1", revision: 5, name: "A" }))
+  await flush()
+
+  // d1 conflicts with the lake; d2 sends the lake's own content again, and a new person.
+  const d1 = await scope().datasets.ingest(people, {
+    changes: [change.upsert({ id: "1", revision: 5, name: "B" })],
+  })
+  await scope().datasets.ingest(people, {
+    changes: [
+      change.upsert({ id: "1", revision: 5, name: "A" }),
+      change.upsert({ id: "2", revision: 1, name: "Ada" }),
+    ],
+  })
+
+  expect(await flush()).toEqual({ kind: "flushed", versions: 1, deliveries: 1 })
+  expect((await rows()).map((row) => row.name)).toEqual(["A", "Ada"])
+
+  const rejected = (await reported()).filter((report) => report.type === "dataset.ingest.rejected")
+  expect(rejected.map((report) => "deliveryId" in report && report.deliveryId)).toEqual([
+    d1.deliveryId,
+  ])
+})
+
 test("a change that stopped being valid since ingest is refused, and the rest commits", async () => {
   // Regression proof: refuse nothing in `mapValidationError` (return the error as it is); the
   // flush fails on the deleted blob and writes nothing.
