@@ -40,6 +40,7 @@ import { SqliteAiUsageStorage } from "./ai-usage-storage"
 import { SqliteArtifactStorage } from "./artifact-storage"
 import { SqliteAuthStorage } from "./auth-storage"
 import { SqliteConnectorConnectionStorage } from "./connector-connection-storage"
+import { SqliteDatasetIngestStorage } from "./dataset-ingest-storage"
 import { SqliteExecutionStorage } from "./execution-storage"
 import { SqliteFileDownloadGrantStorage } from "./file-download-grant-storage"
 import { SqliteFileUploadSessionStorage } from "./file-upload-session-storage"
@@ -108,6 +109,7 @@ export class SqliteStorage implements MigrationCapableStorage {
   readonly shareSessions: ShareSessionStorage
   readonly connectorConnections: SqliteConnectorConnectionStorage
   readonly fileUploadSessions: SqliteFileUploadSessionStorage
+  readonly datasetIngest: SqliteDatasetIngestStorage
   readonly fileDownloadGrants: SqliteFileDownloadGrantStorage
   readonly activity: SqliteActivityStorage
   readonly migrators: readonly StorageMigrator[]
@@ -174,6 +176,7 @@ export class SqliteStorage implements MigrationCapableStorage {
     this.shareSessions = createOperationScopedFacade(stores.shareSessions, scope)
     this.connectorConnections = createOperationScopedFacade(stores.connectorConnections, scope)
     this.fileUploadSessions = createOperationScopedFacade(stores.fileUploadSessions, scope)
+    this.datasetIngest = createOperationScopedFacade(stores.datasetIngest, scope)
     this.fileDownloadGrants = createOperationScopedFacade(stores.fileDownloadGrants, scope)
     this.activity = createOperationScopedFacade(stores.activity, scope)
     this.migrators = options.path ? createSqliteStorageMigrators(options.path) : []
@@ -340,6 +343,7 @@ function createSqliteStores(
     shareSessions,
     connectorConnections: new SqliteConnectorConnectionStorage(connection),
     fileUploadSessions: new SqliteFileUploadSessionStorage(connection),
+    datasetIngest: new SqliteDatasetIngestStorage(connection),
     fileDownloadGrants: new SqliteFileDownloadGrantStorage(connection),
     activity: new SqliteActivityStorage(connection),
   }
@@ -368,6 +372,7 @@ interface SqliteStoreSet {
   readonly shareSessions: SqliteShareSessionStorage
   readonly connectorConnections: SqliteConnectorConnectionStorage
   readonly fileUploadSessions: SqliteFileUploadSessionStorage
+  readonly datasetIngest: SqliteDatasetIngestStorage
   readonly fileDownloadGrants: SqliteFileDownloadGrantStorage
   readonly activity: SqliteActivityStorage
 }

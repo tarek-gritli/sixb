@@ -315,6 +315,7 @@ export const sqliteStorageMigrations = defineMigrations({
     sqliteSql("081-agent-thread-runs-on", agentThreadRunsOnSql),
     sqliteSql("082-agent-token-rates", agentTokenRatesSql),
     sqliteSql("083-agent-computer-sessions", agentComputerSessionsSql),
+    sqliteSql("084-dataset-ingest-inbox", datasetIngestInboxSql),
   ],
 })
 
@@ -721,3 +722,4 @@ import agentTokenRatesSql from "./migrations/082-agent-token-rates.sql" with { t
 import agentComputerSessionsSql from "./migrations/083-agent-computer-sessions.sql" with {
   type: "text",
 }
+import datasetIngestInboxSql from "./migrations/084-dataset-ingest-inbox.sql" with { type: "text" }
