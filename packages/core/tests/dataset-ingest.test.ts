@@ -3,6 +3,7 @@ import {
   change,
   col,
   defineDataset,
+  events,
   InMemoryBlobStorage,
   InMemoryBroker,
   InMemoryLakeStorage,
@@ -12,6 +13,7 @@ import {
 } from "../src"
 import { emptyGrantIndex } from "../src/authorization"
 import { flushSixbErrors } from "../src/error-reporting/capability"
+import { buildEventSelectorPredicate } from "../src/events"
 import { createPrincipalRequestScope, createTestingScope } from "../src/execution/scopes"
 
 const dataset = defineDataset("source.people", {
@@ -85,6 +87,48 @@ test("ingestion validates and orders source changes and only notifies for new ve
   expect(
     await sixb.datasets.ingest(dataset, { changes: [change.delete({ id: "42" }, { sequence: 9 })] })
   ).toMatchObject({ outcome: "created", version: { rowCount: 0 } })
+})
+
+test("ingestion says whether a version it announces changed rows or lineage", async () => {
+  // Red check: emit `rowsChanged: true` instead of the created version's flag.
+  const { host, sixb } = setup()
+  await sixb.datasets.ingest(dataset, {
+    changes: [change.upsert({ id: "42", revision: 8, name: "Sam" })],
+  })
+
+  // The delete of a person the dataset never held only advances source ordering.
+  await sixb.datasets.ingest(dataset, { changes: [change.delete({ id: "7" }, { sequence: 3 })] })
+
+  const announced = (await host.events.read()).flatMap((event) =>
+    event.type === "dataset.version.committed"
+      ? [{ rowsChanged: event.payload.rowsChanged, lineageChanged: event.payload.lineageChanged }]
+      : []
+  )
+  expect(announced).toEqual([
+    { rowsChanged: true, lineageChanged: true },
+    { rowsChanged: false, lineageChanged: false },
+  ])
+})
+
+test("ingestion of a row that only carries a newer sequence triggers no dataset update", async () => {
+  // Red check: drop `isSequenceOnlyChange` from the in-memory merge; the re-read changes rows.
+  const { host, sixb } = setup()
+  const updated = buildEventSelectorPredicate(events.dataset(dataset).updated())
+  const ingest = (revision: number) =>
+    sixb.datasets.ingest(dataset, { changes: [change.upsert({ id: "42", revision, name: "Sam" })] })
+
+  const first = await ingest(8)
+  const reread = await ingest(9)
+  expect(reread).toMatchObject({ outcome: "created", version: { rowsChanged: false } })
+
+  const committed = (await host.events.read()).filter(
+    (event) => event.type === "dataset.version.committed"
+  )
+  expect(committed.map((event) => event.payload)).toMatchObject([
+    { versionId: first.version?.versionId, rowsChanged: true },
+    { versionId: reread.version?.versionId, rowsChanged: false },
+  ])
+  expect(committed.map(updated)).toEqual([true, false])
 })
 
 test("ingestion checks authority and registration before consuming input or creating a dataset", async () => {

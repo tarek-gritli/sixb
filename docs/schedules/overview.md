@@ -50,6 +50,19 @@ export const importInvoices = defineSync("import-invoices")
 A schedule does nothing until attached. IDs must be unique. When a target has multiple schedules,
 any one can request a run.
 
+## Triggers while a run waits
+
+A sync or pipeline reads its sources when it starts, so one run covers every trigger that arrives
+before it starts:
+
+| When a trigger arrives | What happens |
+| --- | --- |
+| A run is waiting to start | The trigger joins it; no new run is queued |
+| A run is running | One new run is queued; later triggers join it |
+
+A joined run shows the trigger that queued it. Workflow triggers and manual run requests always
+queue their own run.
+
 ## Run on an event
 
 Use `.on(...)` to select a typed event. Object and link events can also have a `.where(...)`
@@ -72,6 +85,9 @@ use `.when(schedule, mapper)` to turn event data into that input. See
 You can also select link changes, rule signals, dataset updates, sync or pipeline outcomes, and
 [member changes](../auth/members.md#react-to-member-changes) such as `events.users().joined()`.
 Conditions are supported on object and link events only.
+
+`events.dataset(...).updated()` fires when a new version changes the dataset's rows or
+[markings](../auth/markings.md), not for one that only records new input versions.
 
 Event schedules start work when an event occurs. Use [rules](../rules/overview.md) when you need
 to track whether a condition is currently active or resolved.

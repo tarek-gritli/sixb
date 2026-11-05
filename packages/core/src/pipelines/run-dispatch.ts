@@ -50,6 +50,8 @@ interface DispatchPipelineRunInput extends PipelineRunRequestOptions {
   readonly metadata?: Readonly<Record<string, string>>
   readonly createExecution: (executionId: string, runId: string) => Promise<CreateExecutionInput>
   readonly validateExistingRun?: (run: PipelineRunRecord, storage: Storage) => Promise<void>
+  /** Return a run of this Pipeline that has not started yet instead of queueing another one. */
+  readonly joinQueuedRun?: boolean
 }
 
 type PersistedPipelineRun =
@@ -57,9 +59,10 @@ type PersistedPipelineRun =
   | {
       readonly publish: true
       readonly run: PipelineRunRecord
-      readonly execution: CreateExecutionInput
       readonly queuedAt: Date
       readonly created: boolean
+      /** Defaults to the run id. A trigger that joins a run publishes its own job for it. */
+      readonly jobId?: string
     }
 
 /** Core-owned durable dispatch boundary used by automatic Pipeline triggers. */
@@ -81,6 +84,7 @@ export class PipelineRunDispatcher implements PipelineRunDispatchPort {
       metadata: input.metadata,
       validateExistingRun: (run, storage) =>
         assertAutomaticExecutionIdentity(storage, this.dependencies.id, input, run),
+      joinQueuedRun: true,
       createExecution: async (executionId, runId) =>
         createPrimitiveExecutionRecord({
           id: executionId,
@@ -130,6 +134,19 @@ async function persistPipelineRun(
           return { publish: false, run: raced }
         }
 
+        if (input.joinQueuedRun) {
+          const waiting = await findQueuedPipelineRun(transactionalRuns, input)
+          if (waiting) {
+            return {
+              publish: true,
+              run: waiting,
+              queuedAt: waiting.queuedAt,
+              created: false,
+              jobId: joinJobId(waiting, runId),
+            }
+          }
+        }
+
         await tx.executions.create(execution)
         const run = await transactionalRuns.queue({
           projectId: input.projectId,
@@ -138,7 +155,7 @@ async function persistPipelineRun(
           pipelineId: input.pipeline.id,
           queuedAt,
         })
-        return { publish: true, run, execution, queuedAt, created: true }
+        return { publish: true, run, queuedAt, created: true }
       },
       { isolation: "serializable" }
     )
@@ -150,6 +167,34 @@ async function persistPipelineRun(
     await input.validateExistingRun?.(raced, input.storage)
     return { publish: false, run: raced }
   }
+}
+
+/**
+ * A run that has not started reads each input's latest version when its steps start, so it already
+ * covers a trigger that arrives now. The oldest one starts first.
+ */
+async function findQueuedPipelineRun(
+  pipelineRuns: NonNullable<Storage["pipelineRuns"]>,
+  input: Pick<DispatchPipelineRunInput, "projectId" | "pipeline">
+): Promise<PipelineRunRecord | undefined> {
+  const { runs } = await pipelineRuns.list({
+    projectId: input.projectId,
+    pipelineId: input.pipeline.id,
+    statuses: ["queued"],
+    order: "asc",
+    limit: 1,
+  })
+  return runs[0]
+}
+
+/**
+ * The job a trigger publishes for the run it joins. The run's own job may be gone (a provider
+ * keeps a settled job id, and ignores a new job under it), so each joining trigger brings a job
+ * that can start the run; once it has started, the others complete without doing anything. The id
+ * derives from the trigger's run id, so a redelivered trigger publishes the same job.
+ */
+function joinJobId(waiting: PipelineRunRecord, triggerRunId: string): string {
+  return `${waiting.id}:join:${triggerRunId}`
 }
 
 async function reusePipelineRun(
@@ -165,7 +210,7 @@ async function reusePipelineRun(
     })
     if (!execution)
       throw new PipelineRunError(`[Sixb] Execution '${existing.executionId}' was not found.`)
-    return { publish: true, run: existing, execution, queuedAt: existing.queuedAt, created: false }
+    return { publish: true, run: existing, queuedAt: existing.queuedAt, created: false }
   }
   if (
     existing.status !== "failed" ||
@@ -193,26 +238,28 @@ async function reusePipelineRun(
     pipelineId: existing.pipelineId,
     queuedAt,
   })
-  return { publish: true, run, execution, queuedAt, created: false }
+  return { publish: true, run, queuedAt, created: false }
 }
 
 async function publishPipelineRun(
   input: DispatchPipelineRunInput,
   persisted: Extract<PersistedPipelineRun, { readonly publish: true }>
 ): Promise<PipelineRunRequestResult> {
+  const jobId = persisted.jobId ?? persisted.run.id
+
   try {
     const [job] = await input.queue.enqueue({
       projectId: input.projectId,
       jobs: [
         {
-          id: persisted.run.id,
+          id: jobId,
           type: "pipeline.run.requested",
           payload: { runId: persisted.run.id },
           ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
         },
       ],
     })
-    if (!job || job.id !== persisted.run.id) {
+    if (!job || job.id !== jobId) {
       throw new PipelineRunError(
         `[Sixb] Queue did not acknowledge Pipeline run '${persisted.run.id}'.`
       )

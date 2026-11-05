@@ -47,6 +47,7 @@ export type { DatasetSequenceChange, DatasetSequenceState } from "./source-order
 export {
   assertUnsequencedDatasetWrite,
   datasetSequenceChange,
+  isSequenceOnlyChange,
   reconcileDatasetSequences,
 } from "./source-ordering"
 export type {
@@ -93,4 +94,4 @@ export type {
   ReadDatasetRowsInput,
 } from "./types"
 export type { DatasetCommitProvenance } from "./version-inputs"
-export { hasDatasetProvenanceChanges } from "./version-inputs"
+export { hasDatasetLineageChanges, hasDatasetProvenanceChanges } from "./version-inputs"
