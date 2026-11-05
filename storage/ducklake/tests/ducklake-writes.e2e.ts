@@ -713,9 +713,11 @@ describe("DuckLakeStorage keyed snapshot writes", () => {
     )
   }, 30_000)
 
-  // Regression proof: make the write coordinator's expectsReplacement return false. The first
-  // write after the replacement then compares its rows and writes only the one that changed. Or
-  // drop its LARGE_TABLE_ROWS bound: the small table's write then replaces every row.
+  // Regression proof: make the write coordinator's uncomparedReplacementStreak return undefined.
+  // The first write after the replacement then compares its rows and writes only the one that
+  // changed. Or ignore the parent's uncomparedReplacements: with a new provider for each write,
+  // as a process per run has, no write compares again. Or drop the LARGE_TABLE_ROWS bound: the
+  // small table's write then replaces every row.
   test("replaces every row of a large table without comparing them after a replacement, and compares every 8th", async () => {
     await storage.createDataset(accounts)
     let rows = accountRows(100_000)
@@ -726,9 +728,13 @@ describe("DuckLakeStorage keyed snapshot writes", () => {
     latest = (await guardedSnapshot(accounts, rows, latest)).versionId
     expect(await feedOf(accounts, latest)).toEqual({ delete: 100_000, insert: 100_000 })
 
-    // Then one row changes per write: seven replacements without comparing, then a difference.
+    // Then one row changes per write, each from a new provider: seven replacements without
+    // comparing, then a difference.
     const feeds = []
     for (let write = 1; write <= 9; write++) {
+      await storage.close()
+      storage = createLocalDuckLakeStorage(rootDir)
+
       rows = rows.map((row) => (row.id === `a${write}` ? { ...row, name: "renamed" } : row))
       latest = (await guardedSnapshot(accounts, rows, latest)).versionId
       feeds.push(await feedOf(accounts, latest))

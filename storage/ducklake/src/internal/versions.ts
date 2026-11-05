@@ -19,6 +19,11 @@ export interface SixbCommitMetadata {
    * it, and on schema changes.
    */
   readonly rowChanges?: number
+  /**
+   * How many keyed snapshots in a row, ending with this one, replaced every row without comparing
+   * them with the table first. Absent when this one compared.
+   */
+  readonly uncomparedReplacements?: number
   readonly validatedPrimaryKeyColumns?: readonly string[]
   readonly schemaChange?: SixbSchemaChangeMetadata
   /** As `encodeLineage` stored it: decoded only for the versions a read returns. */
@@ -68,6 +73,7 @@ export function parseCommitMetadata(value: unknown): SixbCommitMetadata | undefi
   const producer = parseDatasetProducer(parsed.sixb.producer)
   const rowCount = parsed.sixb.rowCount
   const rowChanges = parsed.sixb.rowChanges
+  const uncomparedReplacements = parsed.sixb.uncomparedReplacements
   const validatedPrimaryKeyColumns = parsed.sixb.validatedPrimaryKeyColumns
 
   return {
@@ -81,6 +87,9 @@ export function parseCommitMetadata(value: unknown): SixbCommitMetadata | undefi
     ...(isDatasetVersionRefs(parsed.sixb.inputs) ? { inputs: parsed.sixb.inputs } : {}),
     ...(typeof commitId === "string" && isRowCount(rowCount) ? { rowCount } : {}),
     ...(typeof commitId === "string" && isRowCount(rowChanges) ? { rowChanges } : {}),
+    ...(typeof commitId === "string" && isRowCount(uncomparedReplacements)
+      ? { uncomparedReplacements }
+      : {}),
     ...(typeof commitId === "string" && isValidatedPrimaryKeyColumns(validatedPrimaryKeyColumns)
       ? { validatedPrimaryKeyColumns }
       : {}),

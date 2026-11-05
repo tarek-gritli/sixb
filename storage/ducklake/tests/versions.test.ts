@@ -29,6 +29,7 @@ describe("DuckLake version metadata", () => {
             inputs: [{ datasetId: "raw.erp.customers", versionId: "ducklake:7" }],
             rowCount: 1250,
             rowChanges: 12,
+            uncomparedReplacements: 3,
             validatedPrimaryKeyColumns: ["region", "order_id"],
             schemaChange: { addColumns: ["currency"] },
           },
@@ -43,6 +44,7 @@ describe("DuckLake version metadata", () => {
       inputs: [{ datasetId: "raw.erp.customers", versionId: "ducklake:7" }],
       rowCount: 1250,
       rowChanges: 12,
+      uncomparedReplacements: 3,
       validatedPrimaryKeyColumns: ["region", "order_id"],
       schemaChange: { addColumns: ["currency"] },
     })
@@ -68,6 +70,7 @@ describe("DuckLake version metadata", () => {
             schemaChange: { addColumns: ["currency", 42] },
             rowCount: "1250",
             rowChanges: -1,
+            uncomparedReplacements: "3",
             validatedPrimaryKeyColumns: ["order_id", "order_id"],
           },
         })
