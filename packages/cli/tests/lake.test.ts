@@ -124,13 +124,19 @@ describe("sixb lake cleanup", () => {
     }
   })
 
-  test("measures one pass on a dry run", async () => {
+  // Reproduce: print the dry run's counts as they are in ui/screens.ts lakeCleanupView. The
+  // output then reads like the whole backlog.
+  test("measures one pass on a dry run, and says when more remain", async () => {
     lakeFixture.retentionPassesWithMore = 1
 
     const result = await runInProcess(() => runLakeCleanup({ entry, dryRun: true }))
 
     expect(result.error).toBeUndefined()
     expect(lakeFixture.events.filter((event) => event.type === "lake:retention")).toHaveLength(1)
+    expect(flat(result.output)).toContain(
+      "Expired versions 2+ Kept versions 5 Deleted files 3+ Orphaned files 4+"
+    )
+    expect(result.output).toContain("one pass measured, more remain")
   })
 
   // Reproduce: parse the flags after loading the project in commands/lake-cleanup.ts. The project
