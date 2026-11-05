@@ -7,10 +7,12 @@
 export type { Principal, UserPrincipal } from "../auth"
 export type { ConnectorAccountCandidate } from "../connectors"
 export type { SealedConnectorCredential } from "../connectors/credentials"
+export type { MergeChange } from "../datasets/changes"
 export type { SixbFailure } from "../errors/types"
 export type { StoredRuleResolvedEvent, StoredRuleTriggeredEvent } from "../events"
 export type { ReadonlyJsonObject } from "../json"
 export { stableJsonStringify } from "../json"
+export type { DatasetRow } from "../lake-storage/types"
 export type {
   EffectiveChangeCounts,
   PinnedDatasetVersion,
@@ -450,6 +452,19 @@ export {
   ConnectorConnectionStorageError,
   InMemoryConnectorConnectionStorage,
 } from "./connector-connections"
+export type {
+  AcquireDatasetIngestLeaseResult,
+  AppendDatasetIngestDeliveryInput,
+  DatasetIngestBatch,
+  DatasetIngestChange,
+  DatasetIngestDelivery,
+  DatasetIngestFlushRequest,
+  DatasetIngestLease,
+  DatasetIngestStorage,
+  DatasetIngestSummary,
+  TakeDatasetIngestBatchInput,
+} from "./dataset-ingest"
+export { DatasetIngestLeaseLostError, InMemoryDatasetIngestStorage } from "./dataset-ingest"
 export type {
   StorageTransactionErrorCode,
   StorageTransactionErrorOptions,
