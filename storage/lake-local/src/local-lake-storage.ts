@@ -35,7 +35,9 @@ import {
   encodeDatasetPrimaryKey,
   getDatasetMergeChangeValidationError,
   getDatasetPrimaryKeyColumns,
+  hasDatasetLineageChanges,
   hasDatasetProvenanceChanges,
+  isSequenceOnlyChange,
   LakeConcurrencyError,
   type LakeMergeSession,
   type LakeStorage,
@@ -568,22 +570,19 @@ export class LocalLakeStorage implements LakeStorage {
         }
       }
 
+      // An upsert that only carries a newer sequence keeps the stored row: it advances ordering.
       const nextByKey = new Map(previousByKey)
       for (const [primaryKey, change] of finalChanges) {
-        if (change.kind === "upsert") {
-          nextByKey.set(primaryKey, structuredClone(change.row))
-        } else {
+        if (change.kind === "delete") {
           nextByKey.delete(primaryKey)
+        } else if (!isSequenceOnlyChange(definition, previousByKey.get(primaryKey), change.row)) {
+          nextByKey.set(primaryKey, structuredClone(change.row))
         }
       }
 
+      const sameRows = this.sameKeyedRowContent(previousByKey, nextByKey, definition.schema)
       const createInitialVersion = options.commit?.createInitialVersion && latestVersion === null
-      if (
-        !createInitialVersion &&
-        (ordered
-          ? ordered.accepted.size === 0
-          : this.sameKeyedRowContent(previousByKey, nextByKey, definition.schema))
-      ) {
+      if (!createInitialVersion && (ordered ? ordered.accepted.size === 0 : sameRows)) {
         await rm(options.sessionDir, { recursive: true, force: true })
         return { outcome: "unchanged", version: latestVersion }
       }
@@ -617,6 +616,16 @@ export class LocalLakeStorage implements LakeStorage {
           producer: options.merge.producer ? structuredClone(options.merge.producer) : undefined,
           inputs: options.merge.inputs ? structuredClone(options.merge.inputs) : undefined,
           ...(lineage && { lineage }),
+          // A sequenced merge can accept only changes that leave the rows as they were, such as
+          // the delete of an absent key or a stored row with a newer sequence: it still records
+          // the source ordering it advanced.
+          rowsChanged: latestVersion === null || !sameRows,
+          lineageChanged: hasDatasetLineageChanges(latestVersion, {
+            datasetId: definition.id,
+            schema: definition.schema,
+            producer: options.merge.producer,
+            lineage,
+          }),
           rowCount: visibleRows.length,
           sizeBytes: versionRowsStat.size,
         }
@@ -691,18 +700,18 @@ export class LocalLakeStorage implements LakeStorage {
       parent: latestVersion,
     })
 
+    const provenance = {
+      ...options.write,
+      datasetId: definition.id,
+      schema: definition.schema,
+      lineage,
+    }
+    const rowsChanged =
+      !latestVersion || !(await this.isUnchangedWrite(mode, options, latestVersion, definition))
+
     // Content-identical snapshots and empty appends reuse the latest version
     // unless explicitly supplied provenance has changed.
-    if (
-      latestVersion &&
-      !hasDatasetProvenanceChanges(latestVersion, {
-        ...options.write,
-        datasetId: definition.id,
-        schema: definition.schema,
-        lineage,
-      }) &&
-      (await this.isUnchangedWrite(mode, options, latestVersion, definition))
-    ) {
+    if (latestVersion && !rowsChanged && !hasDatasetProvenanceChanges(latestVersion, provenance)) {
       await rm(options.sessionDir, { recursive: true, force: true })
       return { ...latestVersion, outcome: "unchanged" }
     }
@@ -734,6 +743,8 @@ export class LocalLakeStorage implements LakeStorage {
       producer: options.write.producer ? structuredClone(options.write.producer) : undefined,
       inputs: options.write.inputs ? structuredClone(options.write.inputs) : undefined,
       ...(lineage && { lineage }),
+      rowsChanged,
+      lineageChanged: hasDatasetLineageChanges(latestVersion, provenance),
       rowCount:
         mode === "append"
           ? (latestVersion?.rowCount ?? 0) + options.rowKeys.length

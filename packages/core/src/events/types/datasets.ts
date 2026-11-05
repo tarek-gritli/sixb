@@ -11,6 +11,12 @@ export interface DatasetVersionCommittedEvent extends EventEnvelope {
     /** Canonical UTC ISO timestamp from the committed immutable dataset version. */
     createdAt: string
     producer: DatasetProducer
+    /**
+     * As `DatasetVersion.rowsChanged` and `DatasetVersion.lineageChanged`. Absent on events stored
+     * before versions recorded them: read a missing flag as changed (`!== false`).
+     */
+    rowsChanged?: boolean
+    lineageChanged?: boolean
   }
 }
 
