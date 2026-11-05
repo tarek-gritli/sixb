@@ -7,7 +7,12 @@ import {
   reconcileDatasetSequences,
 } from "@sixb/core/lake-storage"
 import type { DuckLakeStorageOptions } from "../types"
-import { type ApplyDatasetRowsResult, inspectUniqueKeyedRelation } from "./dataset-row-commit"
+import {
+  type ApplyDatasetRowsResult,
+  datasetRowDifferenceSql,
+  inspectUniqueKeyedRelation,
+  primaryKeyMatchSql,
+} from "./dataset-row-commit"
 import { getBigIntLike, getOptionalString, getString } from "./duckdb-row"
 import type { DuckDbQueryRuntime } from "./duckdb-runtime"
 import { encodeDatasetSequenceTableName, encodeDatasetTableName } from "./names"
@@ -60,6 +65,9 @@ export async function applyDatasetMergeFromRelation(
           resultingRowCount: { kind: "exact", value: previousRowCount },
           targetWasEmpty: previousRowCount === 0,
           changedTableRows: false,
+          insertedRows: 0,
+          deletedRows: 0,
+          keptUnchangedRows: false,
         }
       }
 
@@ -107,6 +115,9 @@ export async function applyDatasetMergeFromRelation(
         },
         targetWasEmpty: previousRowCount === 0,
         changedTableRows: true,
+        insertedRows: effects.inserts + effects.updates,
+        deletedRows: effects.updates + effects.deletes,
+        keptUnchangedRows: false,
       }
     }
   )
@@ -298,34 +309,6 @@ async function countMergeEffects(
     updates: row === undefined ? 0 : Number(getBigIntLike(row, "update_count")),
     deletes: row === undefined ? 0 : Number(getBigIntLike(row, "delete_count")),
   }
-}
-
-function primaryKeyMatchSql(
-  primaryKeyColumns: readonly string[],
-  leftAlias: string,
-  rightAlias: string
-): string {
-  return primaryKeyColumns
-    .map(
-      (column) =>
-        `${leftAlias}.${quoteIdentifier(column)} = ${rightAlias}.${quoteIdentifier(column)}`
-    )
-    .join(" AND ")
-}
-
-function datasetRowDifferenceSql(
-  dataset: DatasetDefinition,
-  leftAlias: string,
-  rightAlias: string
-): string {
-  return dataset.schema.columns
-    .map(
-      (column) =>
-        `${leftAlias}.${quoteIdentifier(column.name)} IS DISTINCT FROM ${rightAlias}.${quoteIdentifier(
-          column.name
-        )}`
-    )
-    .join(" OR ")
 }
 
 async function countRows(runtime: DuckDbQueryRuntime, relationSql: string): Promise<number> {

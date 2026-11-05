@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import type { DatasetDefinition } from "@sixb/core"
 import {
   type DatasetWriteMode,
@@ -29,7 +30,22 @@ export interface ApplyDatasetRowsResult {
    * concurrent changes to the table. A merge that only advances source ordering changes none.
    */
   readonly changedTableRows: boolean
+  /** Rows of the dataset table this write inserts and deletes: an updated row counts in both. */
+  readonly insertedRows: number
+  readonly deletedRows: number
+  /**
+   * A snapshot that wrote only the rows that differ from the table it read, and kept the others,
+   * rather than replacing every row (see `applyKeyedSnapshot`).
+   */
+  readonly keptUnchangedRows: boolean
 }
+
+/**
+ * A keyed snapshot that changes at least this share of the rows replaces them all, as Foundry
+ * reindexes past 80% of rows changed: the difference would delete and insert nearly as much, and
+ * leave the table's rows spread over more files.
+ */
+const FULL_REPLACEMENT_SHARE = 0.8
 
 export function assertDatasetWriteMode(
   mode: unknown,
@@ -57,8 +73,9 @@ export async function applyDatasetRowsFromRelation(input: {
   const primaryKeyColumns = getDatasetPrimaryKeyColumns(input.dataset)
 
   let baselineRowCount: number | undefined
+  let sourceRowCount: number | undefined
   if (primaryKeyColumns !== null) {
-    await inspectUniqueKeyedRelation({
+    sourceRowCount = await inspectUniqueKeyedRelation({
       runtime: input.runtime,
       dataset: input.dataset,
       relationSql: input.sourceRelationSql,
@@ -83,35 +100,35 @@ export async function applyDatasetRowsFromRelation(input: {
   }
 
   if (input.mode === "snapshot") {
+    if (primaryKeyColumns !== null && sourceRowCount !== undefined) {
+      return applyKeyedSnapshot({
+        runtime: input.runtime,
+        dataset: input.dataset,
+        table,
+        sourceRelationSql: input.sourceRelationSql,
+        sourceRowCount,
+        primaryKeyColumns,
+      })
+    }
+
     const source = await fingerprintRelation(input.runtime, input.sourceRelationSql, columnsSql)
     const target = await fingerprintRelation(input.runtime, table, columnsSql)
 
     if (sameFingerprint(source, target)) {
-      return {
-        dataChangeExpected: false,
-        sourceRowCount: source.rowCount,
-        resultingRowCount: { kind: "exact", value: target.rowCount },
-        targetWasEmpty: target.rowCount === 0,
-        changedTableRows: false,
-      }
+      return unchangedSnapshot(source.rowCount, target.rowCount)
     }
 
-    await input.runtime.run(`DELETE FROM ${table}`)
-    await input.runtime.run(
-      `INSERT INTO ${table} (${columnsSql}) SELECT ${columnsSql} FROM ${input.sourceRelationSql}`
-    )
-
-    const changedTableRows = source.rowCount > 0 || target.rowCount > 0
-    return {
-      dataChangeExpected: changedTableRows,
+    return replaceRows({
+      runtime: input.runtime,
+      table,
+      columnsSql,
+      sourceRelationSql: input.sourceRelationSql,
       sourceRowCount: source.rowCount,
-      resultingRowCount: { kind: "exact", value: source.rowCount },
-      targetWasEmpty: target.rowCount === 0,
-      changedTableRows,
-    }
+      targetRowCount: target.rowCount,
+    })
   }
 
-  const sourceRowCount = await countRows(input.runtime, input.sourceRelationSql)
+  const appendedRowCount = await countRows(input.runtime, input.sourceRelationSql)
   const knownRowCount = baselineRowCount ?? input.previousRowCount
   const targetWasEmpty =
     knownRowCount === undefined ? await isEmptyRelation(input.runtime, table) : knownRowCount === 0
@@ -120,14 +137,207 @@ export async function applyDatasetRowsFromRelation(input: {
   )
 
   return {
-    dataChangeExpected: sourceRowCount > 0,
+    dataChangeExpected: appendedRowCount > 0,
     targetWasEmpty,
-    changedTableRows: sourceRowCount > 0,
-    sourceRowCount,
+    changedTableRows: appendedRowCount > 0,
+    sourceRowCount: appendedRowCount,
     resultingRowCount:
       input.previousRowCount === undefined
         ? { kind: "unknown" }
-        : { kind: "exact", value: input.previousRowCount + sourceRowCount },
+        : { kind: "exact", value: input.previousRowCount + appendedRowCount },
+    insertedRows: appendedRowCount,
+    deletedRows: 0,
+    keptUnchangedRows: false,
+  }
+}
+
+/**
+ * Writes a keyed snapshot as the difference from the table it read: deletes the rows whose key
+ * is gone or whose values changed, and inserts the staged rows that are new or changed. The
+ * version holds exactly the rows a full replacement would, and DuckLake's change feed then shows
+ * only what changed, instead of every row deleted and inserted again.
+ *
+ * One join of the staged rows with the table decides it, in place of comparing a fingerprint of
+ * each. A table that was empty, or a write that changes `FULL_REPLACEMENT_SHARE` of the rows or
+ * more, replaces them all instead.
+ */
+async function applyKeyedSnapshot(input: {
+  readonly runtime: DuckDbQueryRuntime
+  readonly dataset: DatasetDefinition
+  readonly table: string
+  readonly sourceRelationSql: string
+  readonly sourceRowCount: number
+  readonly primaryKeyColumns: readonly string[]
+}): Promise<ApplyDatasetRowsResult> {
+  const columnsSql = datasetSchemaColumnNamesSql(input.dataset.schema)
+  const delta = quoteIdentifier(`sixb_snapshot_delta_${randomUUID().replaceAll("-", "")}`)
+
+  const firstKey = quoteIdentifier(input.primaryKeyColumns[0]!)
+  const sourceMissing = `source.${firstKey} IS NULL`
+  const targetMissing = `target.${firstKey} IS NULL`
+  const deltaKeysSql = input.primaryKeyColumns
+    .map((column) => {
+      const name = quoteIdentifier(column)
+      return `coalesce(source.${name}, target.${name}) AS ${name}`
+    })
+    .join(", ")
+
+  // Keys are non-null and unique on both sides, so a missing side means a new or a removed row.
+  await input.runtime.run(`
+    CREATE TEMP TABLE ${delta} AS
+    SELECT
+      ${deltaKeysSql},
+      NOT (${sourceMissing}) AS in_source,
+      NOT (${targetMissing}) AS in_target
+    FROM ${input.sourceRelationSql} source
+    FULL OUTER JOIN ${input.table} target
+      ON ${primaryKeyMatchSql(input.primaryKeyColumns, "source", "target")}
+    WHERE ${sourceMissing}
+      OR ${targetMissing}
+      OR (${datasetRowDifferenceSql(input.dataset, "source", "target")})
+  `)
+
+  try {
+    const [counts] = await input.runtime.query(`
+      SELECT
+        count(*) AS changed_keys,
+        count(*) FILTER (WHERE in_source) AS inserted,
+        count(*) FILTER (WHERE in_target) AS deleted
+      FROM ${delta}
+    `)
+    const changedKeys = counts === undefined ? 0 : Number(getBigIntLike(counts, "changed_keys"))
+    const insertedRows = counts === undefined ? 0 : Number(getBigIntLike(counts, "inserted"))
+    const deletedRows = counts === undefined ? 0 : Number(getBigIntLike(counts, "deleted"))
+
+    // The source holds every row the table keeps, so the table held those plus the deleted ones.
+    const targetRowCount = input.sourceRowCount - insertedRows + deletedRows
+    if (changedKeys === 0) {
+      return unchangedSnapshot(input.sourceRowCount, targetRowCount)
+    }
+
+    // An updated row is one changed key, both deleted and inserted.
+    const largerSide = Math.max(input.sourceRowCount, targetRowCount)
+    if (targetRowCount === 0 || changedKeys >= FULL_REPLACEMENT_SHARE * largerSide) {
+      return replaceRows({
+        runtime: input.runtime,
+        table: input.table,
+        columnsSql,
+        sourceRelationSql: input.sourceRelationSql,
+        sourceRowCount: input.sourceRowCount,
+        targetRowCount,
+      })
+    }
+
+    await input.runtime.run(`
+      DELETE FROM ${input.table} AS target
+      USING ${delta} AS delta
+      WHERE delta.in_target
+        AND ${primaryKeyMatchSql(input.primaryKeyColumns, "target", "delta")}
+    `)
+
+    await input.runtime.run(`
+      INSERT INTO ${input.table} (${columnsSql})
+      SELECT ${columnsSql}
+      FROM ${input.sourceRelationSql} source
+      WHERE EXISTS (
+        SELECT 1
+        FROM ${delta} delta
+        WHERE delta.in_source
+          AND ${primaryKeyMatchSql(input.primaryKeyColumns, "source", "delta")}
+      )
+    `)
+
+    return {
+      dataChangeExpected: true,
+      sourceRowCount: input.sourceRowCount,
+      resultingRowCount: { kind: "exact", value: input.sourceRowCount },
+      targetWasEmpty: false,
+      changedTableRows: true,
+      insertedRows,
+      deletedRows,
+      keptUnchangedRows: true,
+    }
+  } finally {
+    await dropTemporaryTable(input.runtime, delta)
+  }
+}
+
+/** Deletes every row of the table, then inserts every source row. */
+async function replaceRows(input: {
+  readonly runtime: DuckDbQueryRuntime
+  readonly table: string
+  readonly columnsSql: string
+  readonly sourceRelationSql: string
+  readonly sourceRowCount: number
+  readonly targetRowCount: number
+}): Promise<ApplyDatasetRowsResult> {
+  await input.runtime.run(`DELETE FROM ${input.table}`)
+  await input.runtime.run(
+    `INSERT INTO ${input.table} (${input.columnsSql}) SELECT ${input.columnsSql} FROM ${input.sourceRelationSql}`
+  )
+
+  const changedTableRows = input.sourceRowCount > 0 || input.targetRowCount > 0
+  return {
+    dataChangeExpected: changedTableRows,
+    sourceRowCount: input.sourceRowCount,
+    resultingRowCount: { kind: "exact", value: input.sourceRowCount },
+    targetWasEmpty: input.targetRowCount === 0,
+    changedTableRows,
+    insertedRows: input.sourceRowCount,
+    deletedRows: input.targetRowCount,
+    keptUnchangedRows: false,
+  }
+}
+
+function unchangedSnapshot(sourceRowCount: number, targetRowCount: number): ApplyDatasetRowsResult {
+  return {
+    dataChangeExpected: false,
+    sourceRowCount,
+    resultingRowCount: { kind: "exact", value: targetRowCount },
+    targetWasEmpty: targetRowCount === 0,
+    changedTableRows: false,
+    insertedRows: 0,
+    deletedRows: 0,
+    keptUnchangedRows: false,
+  }
+}
+
+/** Matches rows of two relations on every primary key column. */
+export function primaryKeyMatchSql(
+  primaryKeyColumns: readonly string[],
+  leftAlias: string,
+  rightAlias: string
+): string {
+  return primaryKeyColumns
+    .map(
+      (column) =>
+        `${leftAlias}.${quoteIdentifier(column)} = ${rightAlias}.${quoteIdentifier(column)}`
+    )
+    .join(" AND ")
+}
+
+/** Whether two matched rows differ in any column of the dataset, nulls included. */
+export function datasetRowDifferenceSql(
+  dataset: DatasetDefinition,
+  leftAlias: string,
+  rightAlias: string
+): string {
+  return dataset.schema.columns
+    .map(
+      (column) =>
+        `${leftAlias}.${quoteIdentifier(column.name)} IS DISTINCT FROM ${rightAlias}.${quoteIdentifier(
+          column.name
+        )}`
+    )
+    .join(" OR ")
+}
+
+async function dropTemporaryTable(runtime: DuckDbQueryRuntime, table: string): Promise<void> {
+  try {
+    await runtime.run(`DROP TABLE IF EXISTS ${table}`)
+  } catch {
+    // Preserve the write's outcome. DuckDB rejects statements once the transaction is aborted;
+    // the coordinator rolls it back next, which drops the table it created.
   }
 }
 

@@ -1,12 +1,13 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { col, type DatasetRow, defineDataset } from "@sixb/core"
+import { col, type DatasetDefinition, type DatasetRow, defineDataset } from "@sixb/core"
 import type { DuckLakeStorage } from "../src"
 import type { DuckDbRuntime } from "../src/internal/duckdb-runtime"
 import type { DuckLakeSnapshotReader } from "../src/internal/ducklake-snapshot-reader"
-import { duckLakeMetadataTableName } from "../src/internal/sql"
+import { encodeDatasetTableName } from "../src/internal/names"
+import { duckLakeMetadataTableName, quoteSqlString } from "../src/internal/sql"
 import { parseCommitMetadata, parseVersionId } from "../src/internal/versions"
 import { collectRows, createLocalDuckLakeStorage, localDuckLakeOptions } from "./test-utils"
 
@@ -627,6 +628,205 @@ describe("DuckLakeStorage writes and latest reads", () => {
     )
   })
 })
+
+describe("DuckLakeStorage keyed snapshot writes", () => {
+  let rootDir: string
+  let storage: DuckLakeStorage
+
+  const accounts = defineDataset("crm.accounts", {
+    schema: [col("id", "string"), col("name", "string"), col("score", "int64")],
+    primaryKey: "id",
+  })
+
+  beforeEach(async () => {
+    rootDir = await mkdtemp(join(tmpdir(), "sixb-ducklake-keyed-snapshots-"))
+    storage = createLocalDuckLakeStorage(rootDir)
+  })
+
+  afterEach(async () => {
+    await storage.close()
+    await rm(rootDir, { recursive: true, force: true })
+  })
+
+  // Regression proof: in applyKeyedSnapshot, return replaceRows(...) for every changed write. The
+  // version then deletes and inserts all 2,000 rows.
+  test("writes only the rows that changed, and reads exactly the rows written", async () => {
+    await storage.createDataset(accounts)
+    const seedRows = accountRows(2_000)
+    const seed = await snapshot(accounts, seedRows)
+
+    // The same rows in another order are the same content.
+    const reordered = await snapshot(accounts, [...seedRows].reverse())
+    expect(reordered).toMatchObject({ outcome: "unchanged", versionId: seed.versionId })
+
+    // Three rows change, two go, two arrive.
+    const nextRows = [
+      ...seedRows
+        .filter((row) => row.id !== "a5" && row.id !== "a6")
+        .map((row) =>
+          row.id === "a1" || row.id === "a2" || row.id === "a3" ? { ...row, name: "renamed" } : row
+        ),
+      { id: "new1", name: "new", score: 1 },
+      { id: "new2", name: "new", score: 2 },
+    ]
+    const next = await snapshot(accounts, nextRows)
+
+    expect(next).toMatchObject({ outcome: "created", mode: "snapshot", rowCount: 2_000 })
+    expect(await feedOf(accounts, next.versionId)).toEqual({ delete: 5, insert: 5 })
+    expect(await commitMetadataForVersion(storage, rootDir, next.versionId)).toMatchObject({
+      rowChanges: 10,
+    })
+
+    expect(await sortedRows(accounts, next.versionId)).toEqual(readRows(nextRows))
+    expect(await sortedRows(accounts, seed.versionId)).toEqual(readRows(seedRows))
+  }, 30_000)
+
+  // Regression proof: set FULL_REPLACEMENT_SHARE above 1. The write changing 800 of 1,000 rows
+  // then deletes and inserts only those 800.
+  test("replaces every row once 80% of them change", async () => {
+    await storage.createDataset(accounts)
+    const seedRows = accountRows(1_000)
+    await snapshot(accounts, seedRows)
+
+    const below = await snapshot(accounts, rescored(seedRows, 799, 1))
+    expect(await feedOf(accounts, below.versionId)).toEqual({ delete: 799, insert: 799 })
+
+    const at = await snapshot(accounts, rescored(seedRows, 800, 2))
+    expect(await feedOf(accounts, at.versionId)).toEqual({ delete: 1_000, insert: 1_000 })
+    expect(await commitMetadataForVersion(storage, rootDir, at.versionId)).toMatchObject({
+      rowChanges: 2_000,
+    })
+    expect(await sortedRows(accounts, at.versionId)).toEqual(readRows(rescored(seedRows, 800, 2)))
+  }, 30_000)
+
+  // Regression proof: in applyKeyedSnapshot, drop the delete or the insert statement. The
+  // shrinking or the growing write then keeps rows it removed, or loses rows it added.
+  test("writes a snapshot that only adds or only removes rows", async () => {
+    await storage.createDataset(accounts)
+    const seedRows = accountRows(100)
+    await snapshot(accounts, seedRows)
+
+    const grown = [...seedRows, { id: "new1", name: "new", score: 1 }]
+    const growth = await snapshot(accounts, grown)
+    expect(await feedOf(accounts, growth.versionId)).toEqual({ insert: 1 })
+    expect(await sortedRows(accounts, growth.versionId)).toEqual(readRows(grown))
+
+    const shrunk = grown.filter((row) => row.id !== "a7")
+    const shrink = await snapshot(accounts, shrunk)
+    expect(await feedOf(accounts, shrink.versionId)).toEqual({ delete: 1 })
+    expect(await sortedRows(accounts, shrink.versionId)).toEqual(readRows(shrunk))
+
+    const emptied = await snapshot(accounts, [])
+    expect(emptied).toMatchObject({ outcome: "created", rowCount: 0 })
+    expect(await sortedRows(accounts, emptied.versionId)).toEqual([])
+  }, 30_000)
+
+  // Regression proof: in applyKeyedSnapshot, return replaceRows(...) for every changed write. The
+  // partitioned write then deletes and inserts all 40 rows.
+  test("keeps rewriting an unkeyed snapshot, and diffs a partitioned keyed one", async () => {
+    const events = defineDataset("raw.events", {
+      schema: [col("id", "string"), col("name", "string"), col("score", "int64")],
+    })
+    const partitioned = defineDataset("crm.accounts_by_score", {
+      schema: accounts.schema.columns,
+      primaryKey: "id",
+      partitionBy: ["score"],
+    })
+    await storage.createDataset(events)
+    await storage.createDataset(partitioned)
+
+    const seedRows = accountRows(40)
+    await snapshot(events, seedRows)
+    await snapshot(partitioned, seedRows)
+
+    const nextRows = rescored(seedRows, 1, 3)
+    const unkeyed = await snapshot(events, nextRows)
+    expect(await feedOf(events, unkeyed.versionId)).toEqual({ delete: 40, insert: 40 })
+
+    // Partitioned by score: the changed row moves to another partition.
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const keyed = await snapshot(partitioned, nextRows)
+      expect(await feedOf(partitioned, keyed.versionId)).toEqual({ delete: 1, insert: 1 })
+      expect(await sortedRows(partitioned, keyed.versionId)).toEqual(readRows(nextRows))
+    } finally {
+      warn.mockRestore()
+    }
+  }, 30_000)
+
+  // Regression proof: as above, the write then deletes and inserts all 50 rows.
+  test("writes only the rows that fill a column added later", async () => {
+    await storage.createDataset(accounts)
+    const seedRows = accountRows(50)
+    await snapshot(accounts, seedRows)
+
+    const evolved = defineDataset(accounts.id, {
+      schema: [...accounts.schema.columns, col("region", "string", { nullable: true })],
+      primaryKey: "id",
+    })
+    await storage.createDataset(evolved)
+
+    const nextRows = seedRows.map((row) =>
+      row.id === "a1" || row.id === "a2" ? { ...row, region: "eu" } : row
+    )
+    const next = await snapshot(evolved, nextRows)
+
+    expect(await feedOf(evolved, next.versionId)).toEqual({ delete: 2, insert: 2 })
+    expect(await sortedRows(evolved, next.versionId)).toEqual(
+      readRows(nextRows).map((row) => ({ region: null, ...row }))
+    )
+  }, 30_000)
+
+  async function snapshot(dataset: DatasetDefinition, rows: readonly DatasetRow[]) {
+    const write = await storage.beginWrite({ dataset, mode: "snapshot" })
+    await write.writeRows(rows)
+    return write.commit()
+  }
+
+  async function sortedRows(dataset: DatasetDefinition, versionId: string) {
+    const rows = await collectRows(storage.readRows({ datasetId: dataset.id, versionId }))
+    return rows.sort((left, right) => String(left.id).localeCompare(String(right.id)))
+  }
+
+  /** What DuckLake's change feed holds for one version: rows inserted and deleted, by kind. */
+  async function feedOf(dataset: DatasetDefinition, versionId: string) {
+    const runtime = await (
+      storage as unknown as DuckLakeStorageInternals
+    ).connections.attachedRuntime()
+    const snapshotId = parseVersionId(versionId)
+    const rows = await runtime.query(`
+      SELECT change_type, count(*) AS row_count
+      FROM ducklake_table_changes(
+        'sixb_lake', 'main', ${quoteSqlString(encodeDatasetTableName(dataset.id))},
+        ${snapshotId}, ${snapshotId}
+      )
+      GROUP BY change_type
+    `)
+
+    return Object.fromEntries(rows.map((row) => [row.change_type, Number(row.row_count)]))
+  }
+})
+
+function accountRows(count: number): DatasetRow[] {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `a${index}`,
+    name: `account ${index}`,
+    score: index % 4,
+  }))
+}
+
+/** The first `count` rows with a new score. */
+function rescored(rows: readonly DatasetRow[], count: number, score: number): DatasetRow[] {
+  return rows.map((row, index) => (index < count ? { ...row, score: 10 + score } : row))
+}
+
+function readRow(row: DatasetRow): DatasetRow {
+  return { ...row, score: String(row.score) }
+}
+
+function readRows(rows: readonly DatasetRow[]): DatasetRow[] {
+  return rows.map(readRow).sort((left, right) => String(left.id).localeCompare(String(right.id)))
+}
 
 async function commitMetadataForVersion(
   storage: DuckLakeStorage,

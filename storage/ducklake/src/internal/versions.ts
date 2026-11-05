@@ -13,6 +13,12 @@ export interface SixbCommitMetadata {
   readonly producer?: DatasetVersion["producer"]
   readonly inputs?: DatasetVersion["inputs"]
   readonly rowCount?: number
+  /**
+   * Rows the commit inserted and deleted in the dataset table, an updated row counting twice: what
+   * DuckLake's change feed holds for this version. Absent on versions written before Sixb recorded
+   * it, and on schema changes.
+   */
+  readonly rowChanges?: number
   readonly validatedPrimaryKeyColumns?: readonly string[]
   readonly schemaChange?: SixbSchemaChangeMetadata
   /** As `encodeLineage` stored it: decoded only for the versions a read returns. */
@@ -61,6 +67,7 @@ export function parseCommitMetadata(value: unknown): SixbCommitMetadata | undefi
   const commitId = parsed.sixb.commitId
   const producer = parseDatasetProducer(parsed.sixb.producer)
   const rowCount = parsed.sixb.rowCount
+  const rowChanges = parsed.sixb.rowChanges
   const validatedPrimaryKeyColumns = parsed.sixb.validatedPrimaryKeyColumns
 
   return {
@@ -73,6 +80,7 @@ export function parseCommitMetadata(value: unknown): SixbCommitMetadata | undefi
     ...(producer === undefined ? {} : { producer }),
     ...(isDatasetVersionRefs(parsed.sixb.inputs) ? { inputs: parsed.sixb.inputs } : {}),
     ...(typeof commitId === "string" && isRowCount(rowCount) ? { rowCount } : {}),
+    ...(typeof commitId === "string" && isRowCount(rowChanges) ? { rowChanges } : {}),
     ...(typeof commitId === "string" && isValidatedPrimaryKeyColumns(validatedPrimaryKeyColumns)
       ? { validatedPrimaryKeyColumns }
       : {}),

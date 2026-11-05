@@ -363,12 +363,12 @@ export class DuckLakeWriteCoordinator {
       }
 
       const commitId = randomUUID()
-      await this.setCommitMetadata(
-        input,
+      await this.setCommitMetadata(input, {
         commitId,
-        commitRowCount(input, changeResult, latestVersion),
-        lineage
-      )
+        rowCount: commitRowCount(input, changeResult, latestVersion),
+        rowChanges: changeResult.insertedRows + changeResult.deletedRows,
+        lineage,
+      })
 
       await commitVersionTransaction(
         input.runtime,
@@ -503,10 +503,16 @@ export class DuckLakeWriteCoordinator {
 
   private async setCommitMetadata(
     input: DuckLakeCommitVersionOutcomeRuntimeInput,
-    commitId: string,
-    rowCount: CommitRowCount,
-    lineage: DatasetVersionLineage | undefined
+    commit: {
+      readonly commitId: string
+      readonly rowCount: CommitRowCount
+      /** Rows the commit inserts and deletes in the dataset table (see the change reader). */
+      readonly rowChanges: number
+      readonly lineage: DatasetVersionLineage | undefined
+    }
   ): Promise<void> {
+    const { commitId, rowCount, rowChanges, lineage } = commit
+
     // DuckLake stores this JSON on the snapshot it creates for the current
     // transaction. Version id, timestamp, and data-change detection still come
     // from DuckLake itself. commitId is only a transaction correlation token so
@@ -522,6 +528,7 @@ export class DuckLakeWriteCoordinator {
       producer: input.producer ? structuredClone(input.producer) : undefined,
       inputs: input.inputs ? structuredClone(input.inputs) : undefined,
       ...(rowCount.kind === "exact" ? { rowCount: rowCount.value } : {}),
+      rowChanges,
       ...(validatedPrimaryKeyColumns !== null
         ? { validatedPrimaryKeyColumns: [...validatedPrimaryKeyColumns] }
         : {}),
@@ -748,8 +755,11 @@ export class DuckLakeWriteCoordinator {
  * Whether a version must claim its table so that a concurrent commit cannot build on it unseen.
  *
  * DuckLake commits a transaction on top of snapshots committed since it began unless one of them
- * altered the table or deleted rows it held. Only the earlier commit decides: a claim protects the
- * version that makes it from concurrent commits that land after it, never the reverse. A commit
+ * conflicts with it. Inserting rows conflicts with a commit that deleted rows of the table or
+ * altered it; deleting rows, with one that inserted rows or altered it, or that deleted rows of the
+ * same file (or any inlined rows). Two commits that only insert never conflict, nor two that only
+ * delete from different files. Only the earlier commit decides: a claim protects the version that
+ * makes it from concurrent commits that land after it, never the reverse. A commit
  * that builds on a version it did not see keeps that version's rows, but stores the lineage of
  * the parent it read. For lineage, that is only wrong when the unseen version's stored lineage
  * carries dependencies: rows that depend on their own columns only add nothing to any lineage, so
@@ -760,8 +770,10 @@ export class DuckLakeWriteCoordinator {
  * - A version that changes no rows claims: it is also how it gets a snapshot.
  * - A write into an empty table claims, whatever it holds. It deletes nothing, so a snapshot that
  *   also read the table empty would delete nothing either, and keep the rows it replaces.
- * - A snapshot that deleted rows needs no claim: any concurrent change to the table conflicts with
- *   its deletes.
+ * - A snapshot that replaced every row needs no claim: it inserts and deletes, from every file, so
+ *   any concurrent change to the table's rows conflicts with it.
+ * - A snapshot that wrote only the rows that differ needs none either when it both inserted and
+ *   deleted rows, for the same reason. One that only inserted, or only deleted, claims.
  * - A keyed append or merge claims. DuckLake has no primary key: two writes that insert one new
  *   key both commit unless the earlier one claims.
  * - An unkeyed append into a table with rows claims when the lineage it stores carries a
@@ -777,7 +789,10 @@ function mustClaimTable(
   }
 
   if (input.mode === "snapshot") {
-    return false
+    return (
+      changeResult.keptUnchangedRows &&
+      (changeResult.insertedRows === 0 || changeResult.deletedRows === 0)
+    )
   }
 
   return (

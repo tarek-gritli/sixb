@@ -27,6 +27,7 @@ describe("DuckLake version metadata", () => {
             producer: { kind: "sync", id: "sync-orders", runId: "run_123" },
             inputs: [{ datasetId: "raw.erp.customers", versionId: "ducklake:7" }],
             rowCount: 1250,
+            rowChanges: 12,
             validatedPrimaryKeyColumns: ["region", "order_id"],
             schemaChange: { addColumns: ["currency"] },
           },
@@ -40,6 +41,7 @@ describe("DuckLake version metadata", () => {
       producer: { kind: "sync", id: "sync-orders", runId: "run_123" },
       inputs: [{ datasetId: "raw.erp.customers", versionId: "ducklake:7" }],
       rowCount: 1250,
+      rowChanges: 12,
       validatedPrimaryKeyColumns: ["region", "order_id"],
       schemaChange: { addColumns: ["currency"] },
     })
@@ -64,6 +66,7 @@ describe("DuckLake version metadata", () => {
             inputs: [{ datasetId: "raw.erp.customers" }],
             schemaChange: { addColumns: ["currency", 42] },
             rowCount: "1250",
+            rowChanges: -1,
             validatedPrimaryKeyColumns: ["order_id", "order_id"],
           },
         })
@@ -77,6 +80,7 @@ describe("DuckLake version metadata", () => {
             kind: "datasetVersion",
             datasetId: "raw.erp.orders",
             validatedPrimaryKeyColumns: ["order_id"],
+            rowChanges: 3,
           },
         })
       )
