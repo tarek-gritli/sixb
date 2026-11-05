@@ -55,6 +55,7 @@ import { PgAiLimitStorage } from "./pg-ai-limit-storage"
 import { PgAiUsageStorage } from "./pg-ai-usage-storage"
 import { PgArtifactStorage } from "./pg-artifact-storage"
 import { createPgClient, type SQL, type SQLClient } from "./pg-client"
+import { PgDatasetIngestStorage } from "./pg-dataset-ingest-storage"
 import { PgExecutionStorage } from "./pg-execution-storage"
 import { PgFileDownloadGrantStorage } from "./pg-file-download-grant-storage"
 import { PgFileUploadSessionStorage } from "./pg-file-upload-session-storage"
@@ -185,6 +186,7 @@ export class PostgresStorage implements MigrationCapableStorage, QueryPreparatio
   readonly shareGrants: PgShareGrantStorage
   readonly shareSessions: PgShareSessionStorage
   readonly fileUploadSessions: PgFileUploadSessionStorage
+  readonly datasetIngest: PgDatasetIngestStorage
   readonly fileDownloadGrants: PgFileDownloadGrantStorage
   readonly activity: PgActivityStorage
   readonly migrators: readonly StorageMigrator[]
@@ -275,6 +277,7 @@ export class PostgresStorage implements MigrationCapableStorage, QueryPreparatio
     this.shareGrants = createOperationScopedFacade(stores.shareGrants, scope)
     this.shareSessions = createOperationScopedFacade(stores.shareSessions, scope)
     this.fileUploadSessions = createOperationScopedFacade(stores.fileUploadSessions, scope)
+    this.datasetIngest = createOperationScopedFacade(stores.datasetIngest, scope)
     this.fileDownloadGrants = createOperationScopedFacade(stores.fileDownloadGrants, scope)
     this.activity = createOperationScopedFacade(stores.activity, scope)
     registerPostgresStorageTestingAdapter(this, (durationMs) =>
@@ -450,6 +453,7 @@ function createPostgresStores(
     shareGrants,
     shareSessions,
     fileUploadSessions: new PgFileUploadSessionStorage(sql),
+    datasetIngest: new PgDatasetIngestStorage(sql),
     fileDownloadGrants: new PgFileDownloadGrantStorage(sql),
     activity: new PgActivityStorage(sql),
   }
@@ -478,6 +482,7 @@ interface PostgresStoreSet {
   readonly shareGrants: PgShareGrantStorage
   readonly shareSessions: PgShareSessionStorage
   readonly fileUploadSessions: PgFileUploadSessionStorage
+  readonly datasetIngest: PgDatasetIngestStorage
   readonly fileDownloadGrants: PgFileDownloadGrantStorage
   readonly activity: PgActivityStorage
 }
