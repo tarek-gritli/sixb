@@ -90,6 +90,7 @@ Pass `onError` to `createSixb()`. `reportError` is your monitoring integration. 
 | `event.delivery.failed` | Event delivery failed. |
 | `rule.evaluation.failed` | Rule evaluation failed. |
 | `vector.indexing.failed` | Automatic vector indexing failed. The context identifies the object and profile. |
+| `lake.retention.failed` | Automatic lake cleanup failed three times for one run. The next scheduled run tries again. |
 
 Notifications may be repeated, and a process crash can prevent delivery. Use `notificationId` to deduplicate alerts. The callback does not change the operation's outcome.
 
