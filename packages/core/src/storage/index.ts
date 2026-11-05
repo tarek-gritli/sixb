@@ -455,6 +455,7 @@ export {
 export type {
   AcquireDatasetIngestLeaseResult,
   AppendDatasetIngestDeliveryInput,
+  DatasetIngestAppendResult,
   DatasetIngestBatch,
   DatasetIngestChange,
   DatasetIngestDelivery,

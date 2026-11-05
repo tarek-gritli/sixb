@@ -220,7 +220,7 @@ export function createDatasetsRuntime(
       )
       if (changes.length === 0) return { deliveryId: null, changes: 0 }
 
-      const delivery = await inbox.append({
+      const { delivery, flush } = await inbox.append({
         projectId: runtime.projectId,
         datasetId: registered.id,
         executionId: execution.id,
@@ -228,11 +228,10 @@ export function createDatasetsRuntime(
         changes,
       })
 
-      // Only the delivery that opens a request announces it; the others join that request.
-      const { request, requested } = await inbox.requestFlush({
-        projectId: runtime.projectId,
-        datasetId: registered.id,
-      })
+      // Only the delivery that opens a request announces it; the others join that request. The
+      // announcement follows the commit and never fails the call: the orchestrator's reconciler
+      // queues a flush for a request whose announcement was lost.
+      const { request, requested } = flush
       if (requested) {
         await runtime.events.emit(
           {

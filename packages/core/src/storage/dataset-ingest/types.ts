@@ -62,6 +62,12 @@ export interface AppendDatasetIngestDeliveryInput {
   readonly changes: readonly DatasetIngestChange[]
 }
 
+export interface DatasetIngestAppendResult {
+  readonly delivery: DatasetIngestDelivery
+  /** The flush request the delivery opened or joined. */
+  readonly flush: DatasetIngestFlushRequest
+}
+
 export interface DatasetIngestFlushRequest {
   /** The request a flush job for this dataset is named after. */
   readonly request: number
@@ -83,14 +89,14 @@ export interface TakeDatasetIngestBatchInput {
  * Every method is `async`: a storage's operation-scoped facade serializes only async methods.
  */
 export interface DatasetIngestStorage {
-  /** Stores one delivery, atomically. */
-  append(input: AppendDatasetIngestDeliveryInput): Promise<DatasetIngestDelivery>
-
   /**
-   * Asks for a flush of the dataset, after `append` committed. A request already open covers the
-   * delivery: a flush that takes a batch closes the request and sees every delivery appended
-   * before.
+   * Stores one delivery and asks for a flush of its dataset, in one transaction. A request already
+   * open covers the delivery: a flush that takes a batch closes the request and sees every delivery
+   * appended before.
    */
+  append(input: AppendDatasetIngestDeliveryInput): Promise<DatasetIngestAppendResult>
+
+  /** Asks for a flush of the dataset's deliveries, as `append` does. */
   requestFlush(input: {
     readonly projectId: string
     readonly datasetId: string

@@ -3,6 +3,7 @@ export { DatasetIngestLeaseLostError } from "./provider"
 export type {
   AcquireDatasetIngestLeaseResult,
   AppendDatasetIngestDeliveryInput,
+  DatasetIngestAppendResult,
   DatasetIngestBatch,
   DatasetIngestChange,
   DatasetIngestDelivery,

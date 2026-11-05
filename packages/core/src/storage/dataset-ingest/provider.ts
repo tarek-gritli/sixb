@@ -2,6 +2,7 @@ import { decodeDatasetIngestChanges, encodeDatasetIngestChanges } from "./codec"
 import type {
   AcquireDatasetIngestLeaseResult,
   AppendDatasetIngestDeliveryInput,
+  DatasetIngestAppendResult,
   DatasetIngestBatch,
   DatasetIngestChange,
   DatasetIngestDelivery,
@@ -111,15 +112,15 @@ const READ_PAGE_SIZE = 50
  * database time; every rule about requests, leases and batches lives here so SQLite, PostgreSQL
  * and the in-memory reference cannot drift.
  *
- * Why a request and a batch never miss a delivery: `append` commits first, then `requestFlush`
- * locks the state row. `takeBatch` closes the request and reads the deliveries under that same
- * lock. So either the request found open saw its delivery committed before the batch's read, or
- * the batch closed it first and the request opens a new one.
+ * Why a request and a batch never miss a delivery: `append` inserts the delivery and then locks
+ * the state row to request a flush, in one transaction. `takeBatch` closes the request and reads
+ * the deliveries under that same lock. So either the append commits first and the batch sees its
+ * delivery, or the batch closes the request first and the append opens a new one.
  */
 export class DurableDatasetIngestStorage implements DatasetIngestStorage {
   constructor(private readonly backend: DatasetIngestPersistenceBackend) {}
 
-  async append(input: AppendDatasetIngestDeliveryInput): Promise<DatasetIngestDelivery> {
+  async append(input: AppendDatasetIngestDeliveryInput): Promise<DatasetIngestAppendResult> {
     assertNonBlank(input.projectId, "projectId")
     assertNonBlank(input.datasetId, "datasetId")
     assertNonBlank(input.executionId, "executionId")
@@ -140,9 +141,10 @@ export class DurableDatasetIngestStorage implements DatasetIngestStorage {
         changes,
       }
       const id = await persistence.insertDelivery(input.projectId, record)
+      const flush = await requestFlushIn(persistence, input.projectId, input.datasetId)
 
       const { changes: _changes, ...delivery } = record
-      return { id, ...delivery }
+      return { delivery: { id, ...delivery }, flush }
     })
   }
 
@@ -150,13 +152,9 @@ export class DurableDatasetIngestStorage implements DatasetIngestStorage {
     readonly projectId: string
     readonly datasetId: string
   }): Promise<DatasetIngestFlushRequest> {
-    return this.backend.transaction(async (persistence) => {
-      const state = await persistence.lockState(input.projectId, input.datasetId)
-      if (state.requested) return { request: state.request, requested: false }
-
-      await persistence.writeState(input.projectId, { ...state, requested: true })
-      return { request: state.request, requested: true }
-    })
+    return this.backend.transaction((persistence) =>
+      requestFlushIn(persistence, input.projectId, input.datasetId)
+    )
   }
 
   async acquire(input: {
@@ -419,6 +417,19 @@ export class DurableDatasetIngestStorage implements DatasetIngestStorage {
       })
     })
   }
+}
+
+/** Opens a flush request under the state-row lock, or joins the one open. */
+async function requestFlushIn(
+  persistence: DatasetIngestPersistence,
+  projectId: string,
+  datasetId: string
+): Promise<DatasetIngestFlushRequest> {
+  const state = await persistence.lockState(projectId, datasetId)
+  if (state.requested) return { request: state.request, requested: false }
+
+  await persistence.writeState(projectId, { ...state, requested: true })
+  return { request: state.request, requested: true }
 }
 
 /** A new dataset's state. */

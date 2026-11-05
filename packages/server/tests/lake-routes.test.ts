@@ -132,7 +132,7 @@ describe("GET /api/lake/health", () => {
   test("says what ingested changes wait for a flush, per dataset", async () => {
     const { app, storage } = await createApp()
     const headers = await seedSession(storage, "usr_staff", [staff.id])
-    const delivery = await storage.datasetIngest.append({
+    const { delivery } = await storage.datasetIngest.append({
       projectId,
       datasetId: invoices.id,
       executionId: "exec-webhook",

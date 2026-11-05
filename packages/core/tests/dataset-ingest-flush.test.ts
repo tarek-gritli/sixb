@@ -299,9 +299,7 @@ test("a tie refuses the change that conflicts, not a resend of what the lake hol
   expect((await rows()).map((row) => row.name)).toEqual(["A", "Ada"])
 
   const rejected = (await reported()).filter((report) => report.type === "dataset.ingest.rejected")
-  expect(rejected.map((report) => "deliveryId" in report && report.deliveryId)).toEqual([
-    d1.deliveryId,
-  ])
+  expect(rejected).toEqual([expect.objectContaining({ deliveryId: d1.deliveryId })])
 })
 
 test("a change that stopped being valid since ingest is refused, and the rest commits", async () => {

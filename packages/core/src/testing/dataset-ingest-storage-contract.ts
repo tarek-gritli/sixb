@@ -117,24 +117,22 @@ export function runDatasetIngestStorageContractSuite<TStorage extends DatasetIng
         expect(read.map(({ delivery }) => delivery.id)).toEqual(appended.map(({ id }) => id))
       }))
 
-    test("asks for a flush once per request, and a batch opens the next request", () =>
+    test("asks for a flush with the first delivery of a request, and a batch opens the next", () =>
       withStorage(async (storage) => {
-        await append(storage, [upsert("1")])
-        const opened = await storage.requestFlush({ projectId, datasetId })
-        const covered = await storage.requestFlush({ projectId, datasetId })
+        const opened = (await storage.append(deliveryInput([upsert("1")]))).flush
+        const covered = (await storage.append(deliveryInput([upsert("2")]))).flush
 
         expect(opened.requested).toBe(true)
         expect(covered).toEqual({ request: opened.request, requested: false })
+        expect(await storage.requestFlush({ projectId, datasetId })).toEqual(covered)
 
-        // A delivery appended before the batch is in it, whichever request it asked under.
-        await append(storage, [upsert("2")])
+        // Both deliveries are in the batch, whichever asked.
         const lease = await acquire(storage, "owner-a")
         const batch = await storage.takeBatch({ lease, flushId: "flush-1", maxChanges: 100 })
         expect(batch?.deliveries).toHaveLength(2)
 
         // One appended after the batch asks again, under a request no job used yet.
-        await append(storage, [upsert("3")])
-        const next = await storage.requestFlush({ projectId, datasetId })
+        const next = (await storage.append(deliveryInput([upsert("3")]))).flush
         expect(next.requested).toBe(true)
         expect(next.request).toBeGreaterThan(opened.request)
       }))
@@ -269,7 +267,6 @@ export function runDatasetIngestStorageContractSuite<TStorage extends DatasetIng
         await append(storage, [upsert("3")])
         await storage.append({ ...deliveryInput([upsert("1")]), datasetId: "crm.orgs" })
         await storage.append({ ...deliveryInput([upsert("1")]), projectId: "another-project" })
-        await storage.requestFlush({ projectId, datasetId })
 
         expect(await storage.summarize({ projectId, datasetIds: [datasetId] })).toEqual([
           {
@@ -313,8 +310,8 @@ function deliveryInput(changes: readonly DatasetIngestChange[]) {
   return { projectId, datasetId, executionId: "exec-1", correlationId: "corr-1", changes }
 }
 
-function append(storage: DatasetIngestStorage, changes: readonly DatasetIngestChange[]) {
-  return storage.append(deliveryInput(changes))
+async function append(storage: DatasetIngestStorage, changes: readonly DatasetIngestChange[]) {
+  return (await storage.append(deliveryInput(changes))).delivery
 }
 
 function acquireInput(owner: string, leaseMs = LEASE_MS) {

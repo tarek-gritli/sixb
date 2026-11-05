@@ -25,16 +25,15 @@ runDatasetIngestStorageContractSuite("PgDatasetIngestStorage", {
 const projectId = "dataset-ingest-race"
 const datasetId = "crm.people"
 
-test("a request waits for a batch closing the request it would have joined", async () => {
+test("a delivery waits for a batch closing the request it would have joined", async () => {
   // Regression proof: drop `FOR UPDATE` from `lockState` in pg-dataset-ingest-storage.ts. The
-  // request then reads the request still open, joins it, and the delivery waits with no flush.
+  // delivery then reads the request still open, joins it, and waits with no flush.
   const { storage, schemaName, connectionString } = await createTestStorage()
   const holder = createPgClient({ connectionString, schemaName, max: 1 })
   const inbox = storage.datasetIngest
 
   try {
-    await inbox.append(delivery("1"))
-    expect((await inbox.requestFlush({ projectId, datasetId })).requested).toBe(true)
+    expect((await inbox.append(delivery("1"))).flush.requested).toBe(true)
 
     // A batch that has locked the state row and read the deliveries committed so far.
     let lockHeld!: () => void
@@ -56,15 +55,14 @@ test("a request waits for a batch closing the request it would have joined", asy
     })
     await locked
 
-    // A delivery that commits after the batch read, then asks.
-    await inbox.append(delivery("2"))
-    const asking = inbox.requestFlush({ projectId, datasetId })
+    // A delivery stored after the batch read: its request waits for the batch.
+    const asking = inbox.append(delivery("2"))
     await waitForLockWait(connectionString, asking)
 
     closeRequest()
     await batch
 
-    expect(await asking).toEqual({ request: 1, requested: true })
+    expect((await asking).flush).toEqual({ request: 1, requested: true })
   } finally {
     await holder.end()
     await disposeTestStorage(storage)
