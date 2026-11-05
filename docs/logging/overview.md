@@ -91,6 +91,8 @@ Pass `onError` to `createSixb()`. `reportError` is your monitoring integration. 
 | `rule.evaluation.failed` | Rule evaluation failed. |
 | `vector.indexing.failed` | Automatic vector indexing failed. The context identifies the object and profile. |
 | `lake.retention.failed` | Automatic lake cleanup failed three times for one run. The next scheduled run tries again. |
+| `dataset.ingest.flush.failed` | Ingested changes wait: writing them failed five times in a row, or no worker wrote them for 10 minutes. They stay stored, and writing goes on trying. |
+| `dataset.ingest.rejected` | The lake refused one `ingest` call's changes when writing them. The context names the call, the key and the sequence to send again. |
 
 Notifications may be repeated, and a process crash can prevent delivery. Use `notificationId` to deduplicate alerts. The callback does not change the operation's outcome.
 

@@ -47,6 +47,18 @@ verification fails. Verify signatures using the provider's documented method and
 The example uses the [`people` dataset](../datasets/source-ordering.md). See
 [ingesting changes](../datasets/ingestion.md) for dataset updates and deletes.
 
+`ingest` returns once the changes are stored, before they are in the dataset. A handler that needs
+the data afterwards, such as one that requests a sync reading the dataset, triggers that work from
+the new version instead:
+
+```ts
+import { defineSchedule, events } from "@sixb/core"
+import { people } from "../datasets/people"
+
+// Attach with `.when(peopleUpdated)` to the sync, pipeline or workflow that reads `people`.
+export const peopleUpdated = defineSchedule("people-updated").on(events.dataset(people).updated())
+```
+
 ## Register the URL
 
 Register your webhook's URL with the external service:
