@@ -181,6 +181,50 @@ export function runDatasetSequenceContract<TStorage extends LakeStorage>(
         await options.teardown?.(storage)
       }
     })
+    test("writes many deliveries as one version, and resumes a flush that died after it", async () => {
+      // Regression proof: start a resumed batch as a new one in `DatasetIngestFlush.commit`; the
+      // resumed flush writes the batch again as no change, and the version is never announced.
+      const storage = await options.createStorage()
+      try {
+        const inbox = new InMemoryStorage()
+        const host = new SixbHost({
+          id: "ingest-flush-contract",
+          ontology: [],
+          datasets: [dataset],
+          lakeStorage: storage,
+          broker: new InMemoryBroker(),
+          storage: inbox,
+          queues: new InMemoryQueues(),
+          blobStorage: new InMemoryBlobStorage(),
+        })
+        const sixb = createTestSixb(host)
+        for (let index = 0; index < 50; index += 1) {
+          await sixb.datasets.ingest(dataset, { changes: [upsert(index + 1, `Sam ${index}`)] })
+        }
+
+        // The flush commits, then dies before it deletes its batch.
+        const complete = inbox.datasetIngest.complete
+        inbox.datasetIngest.complete = async () => {
+          throw new Error("worker stopped")
+        }
+        const died = await getDatasetIngestRuntime(host)
+          .flush(dataset.id, new AbortController().signal)
+          .catch((error) => error)
+        inbox.datasetIngest.complete = complete
+        expect(died).toBeInstanceOf(Error)
+
+        const resumed = await getDatasetIngestRuntime(host).flush(
+          dataset.id,
+          new AbortController().signal
+        )
+
+        expect(resumed).toEqual({ kind: "flushed", versions: 1, deliveries: 50 })
+        expect(await storage.listVersions(dataset.id)).toHaveLength(1)
+        expect((await rows(storage)).map((row) => row.name)).toEqual(["Sam 49"])
+      } finally {
+        await options.teardown?.(storage)
+      }
+    })
     test("rebases retained changes while preserving explicit version guards", () =>
       withStorage(async (storage) => {
         // Regression proof: disable retryOnConflict in retryDatasetMergeCommit; the second commit fails.
