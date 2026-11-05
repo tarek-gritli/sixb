@@ -26,7 +26,7 @@ import type {
   WorkflowRunDispatchPort,
 } from "@sixb/core/internal/workflows"
 import type { LakeStorage } from "@sixb/core/lake-storage"
-import type { ProjectionRunStorage } from "@sixb/core/storage"
+import type { DatasetIngestStorage, ProjectionRunStorage } from "@sixb/core/storage"
 
 export type RoutableProjectionDefinition = ProjectionDispatchDescriptor
 
@@ -36,11 +36,14 @@ type ScheduleTriggeredRouteKey =
 type DatasetVersionCommittedRouteKey =
   `${DatasetVersionCommittedEvent["type"]}:${DatasetVersionCommittedEvent["payload"]["datasetId"]}`
 type EventScheduleRouteKey = `event-schedule:${DomainEvent["type"]}:${string}`
+/** Every dataset's flush requests share one route: the job reads the dataset from the event. */
+type DatasetIngestQueuedRouteKey = "dataset.ingest.queued"
 
 export type OrchestratorRouteKey =
   | ScheduleTriggeredRouteKey
   | DatasetVersionCommittedRouteKey
   | EventScheduleRouteKey
+  | DatasetIngestQueuedRouteKey
 
 export interface ProjectionDispatchJobTemplate {
   readonly type: "projection.dispatch"
@@ -70,12 +73,20 @@ export interface LakeRetentionJobTemplate {
   readonly type: "lake.retention.requested"
 }
 
+/** A flush of the dataset an ingestion request names: a worker runs it, never the orchestrator. */
+export interface DatasetIngestFlushJobTemplate {
+  readonly type: "dataset.ingest.flush.requested"
+}
+
 export type OrchestratorJob =
   | { readonly queue: "syncRuns"; readonly job: SyncRunDispatchJobTemplate }
   | { readonly queue: "pipelines"; readonly job: PipelineRunDispatchJobTemplate }
   | { readonly queue: "projections"; readonly job: ProjectionDispatchJobTemplate }
   | { readonly queue: "workflows"; readonly job: WorkflowRunDispatchJobTemplate }
-  | { readonly queue: "lake"; readonly job: LakeRetentionJobTemplate }
+  | {
+      readonly queue: "lake"
+      readonly job: LakeRetentionJobTemplate | DatasetIngestFlushJobTemplate
+    }
 
 export type OrchestratorEventScheduleTarget =
   | { readonly queue: "syncRuns"; readonly syncId: string }
@@ -107,6 +118,8 @@ export interface CompileRoutesParams {
   readonly workflows?: readonly WorkflowDefinition[]
   /** The built-in lake retention schedule, when the project runs it. */
   readonly lakeRetention?: { readonly scheduleId: string }
+  /** Route ingestion requests to flush jobs, when the project can ingest. */
+  readonly datasetIngest?: boolean
 }
 
 export type ScheduleConsumerKind = "sync" | "pipeline" | "workflow"
@@ -144,6 +157,14 @@ export interface ProjectionReconciliationPorts {
   readonly intervalMs?: number
 }
 
+export interface IngestReconciliationPorts {
+  readonly inbox: Pick<DatasetIngestStorage, "summarize">
+  /** Where a dataset whose changes wait with no flush is reported: the host. */
+  readonly reporter: object
+  /** Pause between passes. Defaults to 30 s. */
+  readonly intervalMs?: number
+}
+
 export type WorkflowDispatchInput = AutomaticWorkflowRunDispatchInput
 export type WorkflowDispatcherPort = WorkflowRunDispatchPort
 export type SyncDispatchInput = AutomaticSyncRunDispatchInput
@@ -172,4 +193,6 @@ export interface OrchestratorRuntimeOptions {
   readonly dispatchers: OrchestratorDispatchers
   /** Required when the compiled routes contain projections. */
   readonly projectionReconciliation?: ProjectionReconciliationPorts
+  /** Required when the compiled routes contain ingestion requests. */
+  readonly ingestReconciliation?: IngestReconciliationPorts
 }

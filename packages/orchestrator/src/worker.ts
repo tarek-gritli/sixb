@@ -4,6 +4,7 @@ import type { StoredDomainEvent } from "@sixb/core/internal/events"
 import type { ProjectionDispatchDescriptor } from "@sixb/core/internal/projections"
 import { evaluateEventSchedule } from "@sixb/core/internal/schedules"
 import { Worker } from "@sixb/core/internal/workers"
+import { enqueueIngestFlush, runIngestReconciler } from "./ingest-reconciler"
 import { runProjectionDispatchReconciler } from "./projection-dispatch-reconciler"
 import { routeKeysForEvent } from "./route-key"
 import type {
@@ -76,6 +77,18 @@ export class OrchestratorWorker extends Worker {
           signal
         )
       )
+    }
+
+    if (hasIngestRoute(this.options.routes)) {
+      const reconciliation = this.options.ingestReconciliation
+      if (reconciliation) {
+        consumers.push(
+          runIngestReconciler(
+            { projectId: this.options.projectId, queues: this.options.queues, ...reconciliation },
+            signal
+          )
+        )
+      }
     }
 
     await Promise.all(consumers)
@@ -353,6 +366,20 @@ async function enqueueDirectJob(
       return
     }
     case "lake": {
+      if (item.job.type === "dataset.ingest.flush.requested") {
+        if (sourceEvent.type !== "dataset.ingest.queued") {
+          throw createSixbError(
+            "internal.unexpected",
+            `[SixbOrchestrator] Ingest flush route received unsupported event '${sourceEvent.type}'.`,
+            { details: { projectId: options.projectId, sourceEventType: sourceEvent.type } }
+          )
+        }
+
+        // The request names the job: its deliveries, and a redelivered event, queue one flush.
+        await enqueueIngestFlush(options.queues, options.projectId, sourceEvent.payload, metadata)
+        return
+      }
+
       if (sourceEvent.type !== "schedule.triggered") {
         throw createSixbError(
           "internal.unexpected",
@@ -602,4 +629,8 @@ function eventScheduleRetryDelay(attempt: number): number {
     EVENT_SCHEDULE_RETRY_INITIAL_DELAY_MS * 2 ** attempt,
     EVENT_SCHEDULE_RETRY_MAX_DELAY_MS
   )
+}
+
+function hasIngestRoute(routes: OrchestratorRoutes): boolean {
+  return routes.get("dataset.ingest.queued") !== undefined
 }

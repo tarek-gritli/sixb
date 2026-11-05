@@ -55,6 +55,20 @@ cron schedule, `sixb:lake-retention`, beside the project's own schedules (never 
 occurrence enqueues nothing more. SyncWorker runs them; the orchestrator never touches the lake,
 since one slow catalog write there would stall every route's dispatch.
 
+Ingestion requests are the other lake jobs. `sixb.datasets.ingest` stores its changes in the
+dataset's inbox, and the delivery that opens a flush request emits `dataset.ingest.queued`
+`{ datasetId, request }`; the deliveries that follow join that request. The route turns it into a
+`dataset.ingest.flush.requested` job named `ingest-flush:<dataset>:<request>`, so a request
+queues one job however many deliveries it covers, and a redelivered event queues nothing more.
+SyncWorker's lake lane runs the flush.
+
+The event is a separate write after the delivery is stored, and direct routes are live-only, so
+the orchestrator also runs an ingest reconciler beside the projection one: on start and every 30
+seconds it reads the inbox summary and queues the same job for every dataset whose deliveries
+wait with no flush holding it. A dataset whose oldest delivery has waited 10 minutes with no
+failed flush, as when no sync worker runs, is reported once to `onError` as
+`dataset.ingest.flush.failed`.
+
 Projection admission has an event path and a reconciliation path:
 
 ```text
