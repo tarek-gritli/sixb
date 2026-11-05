@@ -15,6 +15,7 @@ export type { AuthorizedObjectReader } from "../execution/authorized-object-read
 export { VectorIndexingDeferred } from "../objects/vectors/indexing"
 export type { VectorIndexingRuntime } from "../objects/vectors/indexing-runtime"
 export { getVectorIndexingRuntime } from "../objects/vectors/indexing-runtime"
+export { parseDuration } from "../shared/duration"
 export type { OntologyMutationRuntime } from "./ontology-mutations"
 export {
   createOntologyMutationRuntime,
