@@ -198,6 +198,52 @@ describe("DuckLakeStorage changes from the change feed", () => {
     ).toBeNull()
   }, 60_000)
 
+  // Regression proof: in readChangeRange, keep a snapshot that altered the table outside Sixb
+  // out of the range's completeness. The feed then reads across the column dropped and added
+  // again, and reports the before image of the rows it restored without their old note.
+  test("compares the versions instead across a column another client dropped and added again", async () => {
+    const notes = defineDataset("crm.notes", {
+      schema: [col("id", "string"), col("note", "string", { nullable: true })],
+      primaryKey: "id",
+    })
+    await storage.createDataset(notes)
+    const rows = Array.from({ length: 50_100 }, (_, i) => ({
+      id: `n${i}`,
+      note: i < 3 ? `kept ${i}` : null,
+    }))
+    const write = async (next: readonly DatasetRow[]) => {
+      const session = await storage.beginWrite({ dataset: notes, mode: "snapshot" })
+      await session.writeRows(next)
+      return (await session.commit()).versionId
+    }
+
+    const first = await write(rows)
+    await internals(storage).connections.withExclusiveAttached(async (runtime) => {
+      const table = `sixb_lake.main.${quoteIdentifier(encodeDatasetTableName(notes.id))}`
+      await runtime.run(`ALTER TABLE ${table} DROP COLUMN note`)
+      await runtime.run(`ALTER TABLE ${table} ADD COLUMN note VARCHAR`)
+    })
+    const last = await write(rows)
+
+    const compareFeed = spyOn(internals(storage).changes, "compareFeed")
+    const delta = await storage.readChanges({
+      datasetId: notes.id,
+      fromVersionId: first,
+      toVersionId: last,
+      keyColumns: ["id"],
+      columns: ["id", "note"],
+    })
+    const changes: DatasetRowChange[] = []
+    try {
+      for await (const change of delta?.changes ?? []) changes.push(change)
+    } finally {
+      await delta?.close()
+    }
+
+    expect(compareFeed).not.toHaveBeenCalled()
+    expect(changes).toEqual([])
+  }, 60_000)
+
   async function snapshot(rows: readonly DatasetRow[]) {
     const write = await storage.beginWrite({ dataset: accounts, mode: "snapshot" })
     await write.writeRows(rows)

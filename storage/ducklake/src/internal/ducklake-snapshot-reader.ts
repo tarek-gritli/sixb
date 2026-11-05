@@ -100,7 +100,11 @@ export interface DuckLakeChangeRange {
   readonly versions: readonly DatasetSnapshotRow[]
   /** DuckLake maintenance commits on the dataset table in between, oldest first. */
   readonly maintenanceSnapshotIds: readonly string[]
-  /** Every catalog snapshot in between is still there: retention expired none of them. */
+  /**
+   * Every catalog snapshot in between is still there, retention expired none of them, and each
+   * one naming the dataset's tables is a version or a maintenance commit: none altered them
+   * outside Sixb, such as a column dropped and added again.
+   */
   readonly complete: boolean
 }
 
@@ -901,6 +905,7 @@ export class DuckLakeSnapshotReader {
 
     const versions: DatasetSnapshotRow[] = []
     const maintenanceSnapshotIds: string[] = []
+    let alteredOutsideSixb = false
     for (const candidate of [...candidates].reverse()) {
       if (maintainsTable(candidate.changesMade, tableRef.tableId)) {
         maintenanceSnapshotIds.push(candidate.snapshotId)
@@ -910,6 +915,8 @@ export class DuckLakeSnapshotReader {
       const version = this.candidateToSnapshotRow(tableRef.datasetId, tableRef.tableId, candidate)
       if (version) {
         versions.push(version)
+      } else {
+        alteredOutsideSixb = true
       }
     }
 
@@ -920,7 +927,10 @@ export class DuckLakeSnapshotReader {
       WHERE snapshot_id >= ${fromSnapshotId} AND snapshot_id <= ${toSnapshotId}
     `)
     const expected = BigInt(toSnapshotId) - BigInt(fromSnapshotId) + 1n
-    const complete = count !== undefined && getBigIntLike(count, "snapshot_count") === expected
+    const complete =
+      !alteredOutsideSixb &&
+      count !== undefined &&
+      getBigIntLike(count, "snapshot_count") === expected
 
     return { versions, maintenanceSnapshotIds, complete }
   }
