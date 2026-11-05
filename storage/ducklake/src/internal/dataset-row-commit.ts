@@ -372,20 +372,27 @@ export function primaryKeyMatchSql(
     .join(" AND ")
 }
 
-/** Whether two matched rows differ in any column of the dataset, nulls included. */
+/**
+ * Whether two matched rows differ in any column of the dataset, nulls included. A row that
+ * differs only in its `sequenceBy` column is the stored row delivered again
+ * (`isSequenceOnlyChange`): a merge keeps it as is, while the companion table still advances the
+ * key's ordering. Only merges write a sequenced dataset.
+ */
 export function datasetRowDifferenceSql(
   dataset: DatasetDefinition,
   leftAlias: string,
   rightAlias: string
 ): string {
-  return dataset.schema.columns
+  const differences = dataset.schema.columns
+    .filter((column) => column.name !== dataset.sequenceBy)
     .map(
       (column) =>
         `${leftAlias}.${quoteIdentifier(column.name)} IS DISTINCT FROM ${rightAlias}.${quoteIdentifier(
           column.name
         )}`
     )
-    .join(" OR ")
+
+  return differences.length > 0 ? differences.join(" OR ") : "FALSE"
 }
 
 async function dropTemporaryTable(runtime: DuckDbQueryRuntime, table: string): Promise<void> {

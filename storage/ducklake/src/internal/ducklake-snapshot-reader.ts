@@ -45,6 +45,8 @@ export interface DatasetSnapshotRow {
   readonly tableId: bigint
   readonly createdAt: Date
   readonly mode: DatasetVersionMode
+  readonly rowsChanged: boolean
+  readonly lineageChanged: boolean
   readonly parentSnapshotId?: string
   readonly metadata?: SixbCommitMetadata
 }
@@ -138,6 +140,10 @@ const FEED_PAGE_SIZE = 512
 // metadata of its version, whose lineage may be large.
 const SHORT_READ_BATCH_SIZE = 8
 
+// A change read between two versions of identical rows skips comparing them. Consumers read changes
+// for every version they apply, so few versions usually stand between the two.
+const UNCHANGED_ROWS_WALK_LIMIT = 32
+
 // The bulk catalog scan shares one descending walk of recent snapshots across
 // all requested datasets, so its cost is bounded by this window rather than by
 // the dataset count. A dataset whose latest version is older than the window
@@ -208,6 +214,60 @@ export class DuckLakeSnapshotReader {
       }
 
       return this.getVersionForTableRef(runtime, tableRef, snapshotId)
+    })
+  }
+
+  /**
+   * Whether a version holds exactly the rows of an earlier version of the dataset: every version
+   * committed after that one, up to this one, changed no rows.
+   *
+   * Reads the snapshots that name the dataset's tables between the two, from metadata only. More
+   * than `UNCHANGED_ROWS_WALK_LIMIT` of them, or one that is no Sixb version, such as a change
+   * made outside Sixb, reads as false: the caller compares the rows instead.
+   */
+  async holdsRowsOf(
+    datasetId: string,
+    versionId: string,
+    earlierVersionId: string
+  ): Promise<boolean> {
+    const snapshotId = parseVersionId(versionId)
+    const earlierSnapshotId = parseVersionId(earlierVersionId)
+    if (snapshotId === earlierSnapshotId) {
+      return true
+    }
+    if (BigInt(snapshotId) < BigInt(earlierSnapshotId)) {
+      return false
+    }
+
+    this.connections.assertOpen()
+
+    return this.connections.withAttachedRuntime(async (runtime) => {
+      const tableRef = await resolveDatasetTableRef(this.options, runtime, datasetId)
+      if (!tableRef) {
+        return false
+      }
+
+      // Newest first: this version, the snapshots between, then the earlier version itself.
+      const candidates = await this.querySnapshotCandidates(runtime, {
+        table: tableRef,
+        beforeSnapshotId: String(BigInt(snapshotId) + 1n),
+        fromSnapshotId: earlierSnapshotId,
+        limit: UNCHANGED_ROWS_WALK_LIMIT + 1,
+      })
+      if (
+        candidates[0]?.snapshotId !== snapshotId ||
+        candidates[candidates.length - 1]?.snapshotId !== earlierSnapshotId
+      ) {
+        return false
+      }
+
+      return candidates
+        .slice(0, -1)
+        .every(
+          (candidate) =>
+            this.candidateToSnapshotRow(datasetId, tableRef.tableId, candidate)?.rowsChanged ===
+            false
+        )
     })
   }
 
@@ -1197,6 +1257,8 @@ export class DuckLakeSnapshotReader {
         tableId,
         createdAt: candidate.createdAt,
         mode: metadata.mode ?? "schema",
+        rowsChanged: metadata.rowsChanged ?? true,
+        lineageChanged: metadata.lineageChanged ?? true,
         metadata,
       }
     }
@@ -1206,11 +1268,14 @@ export class DuckLakeSnapshotReader {
     // points elsewhere, fail loudly rather than hydrating the wrong lineage.
     this.assertNoMetadataConflict(candidate.snapshotId, datasetId, candidate.metadata)
 
+    // DuckLake recorded a change to the table's rows, whatever the metadata says.
     return {
       snapshotId: candidate.snapshotId,
       tableId,
       createdAt: candidate.createdAt,
       mode: candidate.metadata?.mode ?? (hasDeleteChange ? "snapshot" : "append"),
+      rowsChanged: true,
+      lineageChanged: candidate.metadata?.lineageChanged ?? true,
       ...(candidate.metadata !== undefined ? { metadata: candidate.metadata } : {}),
     }
   }
@@ -1264,6 +1329,8 @@ function snapshotToVersion(
     producer: row.metadata?.producer,
     inputs: row.metadata?.inputs,
     ...storedLineage(tableRef.datasetId, row),
+    rowsChanged: row.rowsChanged,
+    lineageChanged: row.lineageChanged,
     ...(row.metadata?.rowCount !== undefined ? { rowCount: row.metadata.rowCount } : {}),
   }
 }

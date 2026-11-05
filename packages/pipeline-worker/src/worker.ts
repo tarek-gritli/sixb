@@ -1,9 +1,16 @@
+import type { SixbFailure } from "@sixb/core"
 import { reportRunFailure } from "@sixb/core/internal/error-reporting"
+import { captureSixbFailure } from "@sixb/core/internal/errors"
 import { bindDurablePrimitiveExecution } from "@sixb/core/internal/primitive-execution"
 import type { QueueWorkerFailureDecision } from "@sixb/core/internal/workers"
-import { QueueWorker } from "@sixb/core/internal/workers"
+import { QueueWorker, retryUnstartedRun } from "@sixb/core/internal/workers"
 import type { ClaimedQueueJob, PipelineRunRequestedQueueJob } from "@sixb/core/queues"
-import { PIPELINE_RUN_FAILURE_CODES, type PipelineRunStorage } from "@sixb/core/storage"
+import {
+  PIPELINE_RUN_FAILURE_CODES,
+  type PipelineRunFailureCode,
+  type PipelineRunRecord,
+  type PipelineRunStorage,
+} from "@sixb/core/storage"
 import {
   emitDatasetVersionCommitted,
   emitPipelineRunFinished,
@@ -61,6 +68,10 @@ export class PipelineWorker extends QueueWorker<
     if (!run) {
       throw new Error(`[SixbPipelineWorker] Pipeline run '${job.payload.runId}' was not found.`)
     }
+
+    // Each trigger that joined this run published its own job for it. Once one of them has started
+    // the run, the others have nothing left to do.
+    if (run.status !== "queued") return
 
     const durableExecution = await this.host.storage.executions.getById({
       projectId: this.host.id,
@@ -134,17 +145,56 @@ export class PipelineWorker extends QueueWorker<
 
   protected override async onExecutionError(
     claimed: ClaimedQueueJob<PipelineRunRequestedQueueJob>,
-    _error: unknown
+    error: unknown
   ): Promise<QueueWorkerFailureDecision<(typeof PIPELINE_RUN_FAILURE_CODES)[number]>> {
     // Pipeline runs are not all-or-nothing in V1. A previous step may have committed an append
-    // output, so failed pipeline jobs must not be retried automatically.
+    // output, so a job that failed after starting its run must not be retried automatically.
     const run = await this.host.storage.pipelineRuns?.getById({
       projectId: this.host.id,
       id: claimed.job.payload.runId,
     })
+    if (run?.status === "queued") {
+      const retry = retryUnstartedRun(claimed.job.attempt)
+      if (retry) return retry
+
+      return { kind: "fail", failure: await this.failUnstartedRun(claimed, run, error) }
+    }
+
     return run?.status === "failed" && run.error
       ? { kind: "fail", failure: run.error }
       : { kind: "fail" }
+  }
+
+  /**
+   * Automatic dispatch joins a queued run instead of queueing another, so a run whose job ends
+   * before starting it must not stay queued: every later trigger would wait on it forever.
+   */
+  private async failUnstartedRun(
+    claimed: ClaimedQueueJob<PipelineRunRequestedQueueJob>,
+    run: PipelineRunRecord,
+    error: unknown
+  ): Promise<SixbFailure<PipelineRunFailureCode>> {
+    const failure = captureSixbFailure(error, {
+      allowedCodes: PIPELINE_RUN_FAILURE_CODES,
+      defaultCode: "internal.unexpected",
+      details: { pipelineId: run.pipelineId, runId: run.id },
+    })
+
+    await this.context.pipelineRunsStorage.finish({
+      projectId: this.host.id,
+      id: run.id,
+      status: "failed",
+      error: failure,
+    })
+
+    reportRunFailure(this.host, error, {
+      projectId: this.host.id,
+      attempt: claimed.job.attempt,
+      runKind: "pipeline",
+      run: { runId: run.id, pipelineId: run.pipelineId },
+      failure,
+    })
+    return failure
   }
 
   protected override async onAbortError(

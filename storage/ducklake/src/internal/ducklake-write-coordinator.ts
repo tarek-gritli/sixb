@@ -15,6 +15,7 @@ import type {
 import {
   assertUnsequencedDatasetWrite,
   getDatasetPrimaryKeyColumns,
+  hasDatasetLineageChanges,
   hasDatasetProvenanceChanges,
   LakeConcurrencyError,
   LakeStorageError,
@@ -365,12 +366,12 @@ export class DuckLakeWriteCoordinator {
       })
       input.signal?.throwIfAborted()
 
+      // The version this one replaces or builds on: what it records having changed compares with.
+      const parent =
+        latestVersion === undefined ? await this.latestVersionAtReadSnapshot(input) : latestVersion
+
       // A commit that changes no rows is decided against the latest version it compared with.
-      const noOpBase = changeResult.dataChangeExpected
-        ? undefined
-        : latestVersion === undefined
-          ? await this.latestVersionAtReadSnapshot(input)
-          : latestVersion
+      const noOpBase = changeResult.dataChangeExpected ? undefined : parent
 
       const createsVersion =
         noOpBase === undefined || this.noOpCreatesVersion(input, noOpBase, lineage)
@@ -387,6 +388,13 @@ export class DuckLakeWriteCoordinator {
           ? uncomparedReplacements
           : undefined,
         lineage,
+        rowsChanged: parent === null || changeResult.changedTableRows,
+        lineageChanged: hasDatasetLineageChanges(parent, {
+          datasetId: input.dataset.id,
+          schema: input.dataset.schema,
+          producer: input.producer,
+          lineage,
+        }),
       })
 
       await commitVersionTransaction(
@@ -524,7 +532,7 @@ export class DuckLakeWriteCoordinator {
 
   private async setCommitMetadata(
     input: DuckLakeCommitVersionOutcomeRuntimeInput,
-    commit: {
+    commit: Pick<DatasetVersion, "rowsChanged" | "lineageChanged"> & {
       readonly commitId: string
       readonly rowCount: CommitRowCount
       /** Rows the commit inserts and deletes in the dataset table (see the change reader). */
@@ -558,6 +566,8 @@ export class DuckLakeWriteCoordinator {
         ? { validatedPrimaryKeyColumns: [...validatedPrimaryKeyColumns] }
         : {}),
       ...(lineage === undefined ? {} : { lineage: encodeLineage(lineage) }),
+      rowsChanged: commit.rowsChanged,
+      lineageChanged: commit.lineageChanged,
     }
 
     await input.runtime.run(
@@ -612,10 +622,10 @@ export class DuckLakeWriteCoordinator {
   }
 
   /**
-   * The latest version a write that began without reading it compared its rows with: the one at
-   * the lake snapshot its first read fixed. The version metadata also shows versions committed
-   * since. One of this dataset means the rows were compared with an older version, so the write
-   * reruns.
+   * The latest version a write that began without reading it replaces and compared its rows with:
+   * the one at the lake snapshot its first read fixed. The version metadata also shows versions
+   * committed since. One of this dataset means the write was prepared on an older version, so it
+   * reruns: a snapshot that changed rows would conflict with that version at commit anyway.
    */
   private async latestVersionAtReadSnapshot(
     input: DuckLakeCommitVersionOutcomeRuntimeInput
@@ -662,8 +672,9 @@ export class DuckLakeWriteCoordinator {
 
   /**
    * Every version but a snapshot keeps its parent's rows, and the lineage it records merges the
-   * parent's. A snapshot replaces its parent: it reads it only to guard on it, or on SQLite, whose
-   * later reads inside the transaction would block its commit.
+   * parent's. A snapshot replaces its parent: it reads it first only to guard on it, or on SQLite,
+   * whose later reads inside the transaction would block its commit. Otherwise it reads it once
+   * its rows are written (see `latestVersionAtReadSnapshot`).
    */
   private async beginVersionTransaction(
     input: DuckLakeCommitVersionOutcomeRuntimeInput

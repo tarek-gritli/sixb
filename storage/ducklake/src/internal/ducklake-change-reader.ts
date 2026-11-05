@@ -68,6 +68,13 @@ export class DuckLakeChangeReader {
     const after = await this.snapshots.getVersion(input.datasetId, input.toVersionId)
     const columns = resolveDatasetChangeColumns(input, before, after)
     if (!columns || !before || !after) return null
+
+    // Versions that only record new provenance or source ordering hold their parent's rows: their
+    // change set is empty, whatever the keys, so it needs neither the key checks nor the join.
+    const unchanged =
+      (input.toVersionId === input.fromVersionId || !after.rowsChanged) &&
+      (await this.snapshots.holdsRowsOf(input.datasetId, input.toVersionId, input.fromVersionId))
+
     const lease = await this.connections.acquireAttachedRuntime()
     const runtime = lease.runtime
     const temporary = quoteIdentifier(`sixb_delta_${randomUUID().replaceAll("-", "")}`)
@@ -76,6 +83,15 @@ export class DuckLakeChangeReader {
     try {
       const ref = await resolveDatasetTableRef(this.options, runtime, input.datasetId)
       if (!ref) return null
+
+      if (unchanged) {
+        const table = qualifiedTableName(this.options, ref.tableName)
+        return noChanges(
+          after.rowCount ??
+            before.rowCount ??
+            (await rowCountAt(runtime, table, parseVersionId(input.toVersionId)))
+        )
+      }
 
       const feed = await this.planFeedRead(runtime, ref, input, before, after)
       input.signal?.throwIfAborted()
@@ -392,6 +408,18 @@ function invalidKeysSql(keys: readonly string[]): string {
     .map(quoteIdentifier)
     .map((name) => `${name} IS NULL OR trim(${name}) = ''`)
     .join(" OR ")
+}
+
+function noChanges(rowCount: number): DatasetChanges {
+  return {
+    fromRowCount: rowCount,
+    toRowCount: rowCount,
+    changeCount: 0,
+    changes: (async function* () {
+      yield* []
+    })(),
+    async close() {},
+  }
 }
 
 async function uniqueRowCount(

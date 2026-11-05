@@ -14,6 +14,19 @@ is lost. Replaying the same dispatch republishes a queued run using the same job
 identities; it does not restart a running or terminal run. Queue providers must honor their stable
 job-ID idempotency contract.
 
+A Sync or Pipeline dispatch whose own run does not exist yet joins a run of the same Sync or
+Pipeline that is still queued; it queues its own run only when none waits. A queued run reads the
+latest inputs when it starts, so it covers the trigger. The joining trigger publishes a job of its
+own for that run, `<joined run id>:join:<own run id>`, because the run's own job may be settled and
+its id ignored by the provider; once a job has started the run, the others complete without work.
+Replaying a joining trigger publishes the same job, but once the joined run has started the replay
+finds no run of its own and queues one more. Workflow dispatch never joins: each run carries its
+trigger's input.
+
+The Sync and Pipeline workers keep `queued` meaning "a job will start it": a job that fails before
+starting its run retries twice (250 ms, then 500 ms) and then fails the run, which has committed
+nothing yet.
+
 The orchestrator returns its processing promise to the broker:
 
 ```text

@@ -28,6 +28,10 @@ export interface SixbCommitMetadata {
   readonly schemaChange?: SixbSchemaChangeMetadata
   /** As `encodeLineage` stored it: decoded only for the versions a read returns. */
   readonly lineage?: unknown
+  /** As `DatasetVersion.rowsChanged`. Absent on versions written before Sixb recorded it. */
+  readonly rowsChanged?: boolean
+  /** As `DatasetVersion.lineageChanged`. Absent on versions written before Sixb recorded it. */
+  readonly lineageChanged?: boolean
 }
 
 export function parseVersionId(versionId: string): string {
@@ -75,6 +79,7 @@ export function parseCommitMetadata(value: unknown): SixbCommitMetadata | undefi
   const rowChanges = parsed.sixb.rowChanges
   const uncomparedReplacements = parsed.sixb.uncomparedReplacements
   const validatedPrimaryKeyColumns = parsed.sixb.validatedPrimaryKeyColumns
+  const { rowsChanged, lineageChanged } = parsed.sixb
 
   return {
     kind: "datasetVersion",
@@ -97,6 +102,8 @@ export function parseCommitMetadata(value: unknown): SixbCommitMetadata | undefi
       ? { schemaChange: parsed.sixb.schemaChange }
       : {}),
     ...(parsed.sixb.lineage === undefined ? {} : { lineage: parsed.sixb.lineage }),
+    ...(typeof rowsChanged === "boolean" ? { rowsChanged } : {}),
+    ...(typeof lineageChanged === "boolean" ? { lineageChanged } : {}),
   }
 }
 

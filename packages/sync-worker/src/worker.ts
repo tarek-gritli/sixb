@@ -1,5 +1,13 @@
-import type { DomainEventLog, LakeStorage, Queues, SixbDefinitions, Storage } from "@sixb/core"
+import type {
+  DomainEventLog,
+  LakeStorage,
+  Queues,
+  SixbDefinitions,
+  SixbFailure,
+  Storage,
+} from "@sixb/core"
 import { reportRunFailure } from "@sixb/core/internal/error-reporting"
+import { captureSixbFailure } from "@sixb/core/internal/errors"
 import type { LoggingService } from "@sixb/core/internal/logging"
 import {
   bindDurablePrimitiveExecution,
@@ -8,10 +16,15 @@ import {
 import { getLakeRetentionRuntime } from "@sixb/core/internal/runtime"
 import { resolveSyncConnectorSources } from "@sixb/core/internal/syncs"
 import type { QueueWorkerFailureDecision } from "@sixb/core/internal/workers"
-import { QueueWorker } from "@sixb/core/internal/workers"
+import { QueueWorker, retryUnstartedRun } from "@sixb/core/internal/workers"
 import type { DatasetVersion } from "@sixb/core/lake-storage"
 import type { ClaimedQueueJob, SyncRunRequestedQueueJob } from "@sixb/core/queues"
-import { SYNC_RUN_FAILURE_CODES, type SyncRunRecord, type SyncRunStatus } from "@sixb/core/storage"
+import {
+  SYNC_RUN_FAILURE_CODES,
+  type SyncRunFailureCode,
+  type SyncRunRecord,
+  type SyncRunStatus,
+} from "@sixb/core/storage"
 import { LakeWorker } from "./lake-worker"
 import { runSyncJob, SyncRunAlreadyStartedError } from "./run-sync-job"
 import type { SyncWorkerContext } from "./types"
@@ -86,6 +99,10 @@ export class SyncWorker extends QueueWorker<
       throw new Error(`[SixbSyncWorker] Sync run '${job.payload.runId}' was not found.`)
     }
 
+    // Each trigger that joined this run published its own job for it. Once one of them has started
+    // the run, the others have nothing left to do.
+    if (run.status !== "queued") return
+
     const durableExecution = await this.host.storage.executions.getById({
       projectId: this.host.id,
       id: run.executionId,
@@ -137,15 +154,59 @@ export class SyncWorker extends QueueWorker<
 
   protected override async onExecutionError(
     claimed: ClaimedQueueJob<SyncRunRequestedQueueJob>,
-    _error: unknown
+    error: unknown
   ): Promise<QueueWorkerFailureDecision<(typeof SYNC_RUN_FAILURE_CODES)[number]>> {
     const run = await this.host.storage.syncRuns?.getById({
       projectId: this.host.id,
       id: claimed.job.payload.runId,
     })
+    if (run?.status === "queued") {
+      const retry = retryUnstartedRun(claimed.job.attempt)
+      if (retry) return retry
+
+      return { kind: "fail", failure: await this.failUnstartedRun(claimed, run, error) }
+    }
+
     return run?.status === "failed" && run.error
       ? { kind: "fail", failure: run.error }
       : { kind: "fail" }
+  }
+
+  /**
+   * Automatic dispatch joins a queued run instead of queueing another, so a run whose job ends
+   * before starting it must not stay queued: every later trigger would wait on it forever.
+   */
+  private async failUnstartedRun(
+    claimed: ClaimedQueueJob<SyncRunRequestedQueueJob>,
+    run: SyncRunRecord,
+    error: unknown
+  ): Promise<SixbFailure<SyncRunFailureCode>> {
+    const syncRuns = this.host.storage.syncRuns
+    if (!syncRuns) {
+      throw new Error("[SixbSyncWorker] Sync workers require storage.syncRuns support.")
+    }
+
+    const failure = captureSixbFailure(error, {
+      allowedCodes: SYNC_RUN_FAILURE_CODES,
+      defaultCode: "internal.unexpected",
+      details: { syncId: run.syncId, runId: run.id, datasetId: run.datasetId },
+    })
+
+    await syncRuns.finish({
+      projectId: this.host.id,
+      id: run.id,
+      status: "failed",
+      error: failure,
+    })
+
+    reportRunFailure(this.host, error, {
+      projectId: this.host.id,
+      attempt: claimed.job.attempt,
+      runKind: "sync",
+      run: { runId: run.id, syncId: run.syncId },
+      failure,
+    })
+    return failure
   }
 }
 
@@ -199,6 +260,8 @@ async function emitSyncRunFinishedEvents(
                     id: run.syncId,
                     runId: run.id,
                   },
+                  rowsChanged: createdVersion.rowsChanged,
+                  lineageChanged: createdVersion.lineageChanged,
                 },
               },
             ]
