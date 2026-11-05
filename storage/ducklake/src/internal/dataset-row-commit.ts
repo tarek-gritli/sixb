@@ -47,6 +47,30 @@ export interface ApplyDatasetRowsResult {
  */
 const FULL_REPLACEMENT_SHARE = 0.8
 
+/**
+ * A large difference is replaced from a far smaller share: deleting many rows across a table's
+ * files costs more than writing every row anew. Measured on DuckDB 1.5.6, a difference of 10% of a
+ * million rows took as long as a full replacement, and 20% half as long again; with 100,000 rows,
+ * 60% took 12% longer. Up to 5,000 rows, or 5% of the table, it was faster, as it was at any share
+ * of 5,000 rows or fewer.
+ */
+const LARGE_DIFFERENCE_ROWS = 5_000
+const LARGE_DIFFERENCE_SHARE = 0.05
+
+/** Whether a keyed snapshot changing this many rows of a table this size replaces them all. */
+export function replacesEveryRow(changedKeys: number, tableRows: number): boolean {
+  return (
+    changedKeys >= FULL_REPLACEMENT_SHARE * tableRows ||
+    (changedKeys >= LARGE_DIFFERENCE_ROWS && changedKeys >= LARGE_DIFFERENCE_SHARE * tableRows)
+  )
+}
+
+/**
+ * The smallest table in which a difference is always under `LARGE_DIFFERENCE_SHARE`: in it, a
+ * difference inserts and deletes fewer rows than the table holds, and a replacement more.
+ */
+export const LARGE_TABLE_ROWS = LARGE_DIFFERENCE_ROWS / LARGE_DIFFERENCE_SHARE
+
 export function assertDatasetWriteMode(
   mode: unknown,
   operation: string
@@ -158,8 +182,8 @@ export async function applyDatasetRowsFromRelation(input: {
  * only what changed, instead of every row deleted and inserted again.
  *
  * One join of the staged rows with the table decides it, in place of comparing a fingerprint of
- * each. A table that was empty, or a write that changes `FULL_REPLACEMENT_SHARE` of the rows or
- * more, replaces them all instead.
+ * each. A table that was empty, or a write that changes enough of its rows (`replacesEveryRow`),
+ * replaces them all instead.
  */
 async function applyKeyedSnapshot(input: {
   readonly runtime: DuckDbQueryRuntime
@@ -217,7 +241,7 @@ async function applyKeyedSnapshot(input: {
 
     // An updated row is one changed key, both deleted and inserted.
     const largerSide = Math.max(input.sourceRowCount, targetRowCount)
-    if (targetRowCount === 0 || changedKeys >= FULL_REPLACEMENT_SHARE * largerSide) {
+    if (targetRowCount === 0 || replacesEveryRow(changedKeys, largerSide)) {
       return replaceRows({
         runtime: input.runtime,
         table: input.table,

@@ -681,22 +681,35 @@ describe("DuckLakeStorage keyed snapshot writes", () => {
     expect(await sortedRows(accounts, seed.versionId)).toEqual(readRows(seedRows))
   }, 30_000)
 
-  // Regression proof: set FULL_REPLACEMENT_SHARE above 1. The write changing 800 of 1,000 rows
-  // then deletes and inserts only those 800.
-  test("replaces every row once 80% of them change", async () => {
+  // Regression proof: in replacesEveryRow, drop either rule. The write changing 800 of 1,000 rows,
+  // or the one changing 5,000 of 10,000, then deletes and inserts only those.
+  test("replaces every row once 80% of them change, or 5% of a large table", async () => {
     await storage.createDataset(accounts)
-    const seedRows = accountRows(1_000)
-    await snapshot(accounts, seedRows)
+    const small = accountRows(1_000)
+    await snapshot(accounts, small)
 
-    const below = await snapshot(accounts, rescored(seedRows, 799, 1))
+    const below = await snapshot(accounts, rescored(small, 799, 1))
     expect(await feedOf(accounts, below.versionId)).toEqual({ delete: 799, insert: 799 })
 
-    const at = await snapshot(accounts, rescored(seedRows, 800, 2))
+    const at = await snapshot(accounts, rescored(small, 800, 2))
     expect(await feedOf(accounts, at.versionId)).toEqual({ delete: 1_000, insert: 1_000 })
     expect(await commitMetadataForVersion(storage, rootDir, at.versionId)).toMatchObject({
       rowChanges: 2_000,
     })
-    expect(await sortedRows(accounts, at.versionId)).toEqual(readRows(rescored(seedRows, 800, 2)))
+    expect(await sortedRows(accounts, at.versionId)).toEqual(readRows(rescored(small, 800, 2)))
+
+    // 5,000 rows of 10,000 is a large difference: a replacement, where 4,999 is not.
+    const large = accountRows(10_000)
+    await snapshot(accounts, large)
+
+    const fewer = await snapshot(accounts, rescored(large, 4_999, 3))
+    expect(await feedOf(accounts, fewer.versionId)).toEqual({ delete: 4_999, insert: 4_999 })
+
+    const enough = await snapshot(accounts, rescored(large, 5_000, 4))
+    expect(await feedOf(accounts, enough.versionId)).toEqual({ delete: 10_000, insert: 10_000 })
+    expect(await sortedRows(accounts, enough.versionId)).toEqual(
+      readRows(rescored(large, 5_000, 4))
+    )
   }, 30_000)
 
   // Regression proof: in applyKeyedSnapshot, drop the delete or the insert statement. The
