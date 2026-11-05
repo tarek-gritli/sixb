@@ -69,6 +69,8 @@ export const sixb = createSixb({
       failure = `event delivery failed with ${context.failure.code} after ${context.attempts} attempt(s)`
     } else if (context.type === "vector.indexing.failed") {
       failure = `vector profile '${context.profile}' on '${context.objectTypeId}:${context.primaryId}' failed with ${context.failure.code}`
+    } else if (context.type === "lake.retention.failed") {
+      failure = `lake retention for ${context.occurrenceAt} failed with ${context.failure.code}`
     } else {
       failure = `${context.source} rule evaluation failed with ${context.failure.code}`
     }
