@@ -258,6 +258,71 @@ describe("DuckLakeStorage remote catalogs", () => {
     }
   })
 
+  // Regression proof: in readChangeRange, report every range incomplete. The read then compares
+  // the two versions in full instead of reading the feed.
+  test("reads a delta from the change feed of a PostgreSQL catalog", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "sixb-ducklake-pg-feed-"))
+    const storage = new DuckLakeStorage({
+      catalog: postgresCatalog(),
+      dataPath: join(rootDir, "data"),
+    })
+    const accounts = defineDataset(`crm.pg.feed.${randomId()}`, {
+      schema: [col("id", "string"), col("name", "string")],
+      primaryKey: "id",
+    })
+    const seed = Array.from({ length: 50_100 }, (_, i) => ({ id: `a${i}`, name: "seed" }))
+    const snapshot = async (rows: readonly { id: string; name: string }[]) => {
+      const write = await storage.beginWrite({ dataset: accounts, mode: "snapshot" })
+      await write.writeRows(rows)
+      return write.commit()
+    }
+
+    try {
+      await storage.createDataset(accounts)
+      const first = await snapshot(seed)
+      await snapshot([...seed.slice(1), { id: "new", name: "added" }])
+      const merge = await storage.beginMerge({ dataset: accounts })
+      await merge.writeChanges([change.upsert({ id: "a2", name: "merged" })])
+      const last = (await merge.commit()).version!
+
+      const changes = (
+        storage as unknown as { changes: { compareFeed(...args: unknown[]): Promise<boolean> } }
+      ).changes
+      const compareFeed = spyOn(changes, "compareFeed")
+      const delta = await storage.readChanges({
+        datasetId: accounts.id,
+        fromVersionId: first.versionId,
+        toVersionId: last.versionId,
+        keyColumns: ["id"],
+        columns: ["id", "name"],
+      })
+      const read: unknown[] = []
+      try {
+        for await (const change of delta!.changes) read.push(change)
+      } finally {
+        await delta?.close()
+      }
+
+      expect(await compareFeed.mock.results[0]?.value).toBe(true)
+      expect(delta).toMatchObject({ fromRowCount: 50_100, toRowCount: 50_100, changeCount: 3 })
+      const id = (change: unknown) => {
+        const { before, after } = change as {
+          before: { id: string } | null
+          after: { id: string } | null
+        }
+        return (after ?? before)!.id
+      }
+      expect(read.sort((left, right) => id(left).localeCompare(id(right)))).toEqual([
+        { before: { id: "a0", name: "seed" }, after: null },
+        { before: { id: "a2", name: "seed" }, after: { id: "a2", name: "merged" } },
+        { before: null, after: { id: "new", name: "added" } },
+      ])
+    } finally {
+      await storage.close()
+      await rm(rootDir, { recursive: true, force: true })
+    }
+  }, 60_000)
+
   // Regression proof: in DuckLakeMaintenance.planExpiry, expire the last version of each dataset,
   // or ignore `protect`. The idle dataset's version, or the protected one, then expires.
   test("keeps needed versions during retention of a PostgreSQL catalog", async () => {

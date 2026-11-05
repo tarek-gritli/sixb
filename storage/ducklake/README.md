@@ -226,7 +226,22 @@ replaced.
 
 A difference of up to 10 rows is inlined in the catalog and writes no file; automatic compaction
 moves inlined rows to files later. DuckLake's change feed then holds only what each version
-changed.
+changed, and change reads between two versions use it (below).
+
+### Change Reads
+
+`readChanges` returns what changed between two versions. It reads DuckLake's change feed, at a
+cost that follows what changed, when:
+
+- the identity is the dataset's primary key;
+- both versions together hold at least 100,000 rows, and the versions in between inserted and
+  deleted at most half as many rows;
+- every version in between was committed by this provider, which records what each one changed,
+  and none changed the schema;
+- retention expired no snapshot in between.
+
+Otherwise it compares both versions in full. Compaction commits in between are skipped: they move
+rows without changing them.
 
 ## Keyed Merges
 

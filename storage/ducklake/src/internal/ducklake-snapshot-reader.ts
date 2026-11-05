@@ -32,6 +32,7 @@ import {
 import { buildDuckLakeMetadataQuery, duckLakeMetadataTableName, quoteSqlString } from "./sql"
 import {
   changesTouchTables,
+  maintainsTable,
   parseCommitMetadata,
   parseTableDataChange,
   parseVersionId,
@@ -66,6 +67,8 @@ interface SnapshotCandidateQueryInput {
   readonly table: DatasetTableRef
   readonly exactSnapshotId?: string
   readonly beforeSnapshotId?: string
+  /** Inclusive lower bound, on top of the table's creation. */
+  readonly fromSnapshotId?: string
   readonly limit: number
 }
 
@@ -89,6 +92,16 @@ export interface DuckLakeHistorySnapshot {
   readonly beforeCutoff: boolean
   /** The datasets it holds a version of: none for a maintenance or catalog-only commit. */
   readonly versionOf: readonly string[]
+}
+
+/** A dataset's history between two of its versions, as a change read plans over it. */
+export interface DuckLakeChangeRange {
+  /** Its versions from the first one to the last one, both included, oldest first. */
+  readonly versions: readonly DatasetSnapshotRow[]
+  /** DuckLake maintenance commits on the dataset table in between, oldest first. */
+  readonly maintenanceSnapshotIds: readonly string[]
+  /** Every catalog snapshot in between is still there: retention expired none of them. */
+  readonly complete: boolean
 }
 
 /** What a commit needs of the version it builds on. */
@@ -846,6 +859,57 @@ export class DuckLakeSnapshotReader {
     return latest ?? null
   }
 
+  /**
+   * The dataset's versions and the table's maintenance commits from one version to a later one,
+   * or null when more than `limit` snapshots name the dataset's tables in between. It reads the
+   * snapshots of that range only, and counts the catalog's to tell whether any was expired.
+   */
+  async readChangeRange(
+    runtime: DuckDbQueryRuntime,
+    tableRef: DatasetTableRef,
+    fromSnapshotId: string,
+    toSnapshotId: string,
+    limit: number
+  ): Promise<DuckLakeChangeRange | null> {
+    assertDuckLakeSnapshotId(fromSnapshotId)
+    assertDuckLakeSnapshotId(toSnapshotId)
+
+    const candidates = await this.querySnapshotCandidates(runtime, {
+      table: tableRef,
+      fromSnapshotId,
+      beforeSnapshotId: (BigInt(toSnapshotId) + 1n).toString(),
+      limit: limit + 1,
+    })
+    if (candidates.length > limit) {
+      return null
+    }
+
+    const versions: DatasetSnapshotRow[] = []
+    const maintenanceSnapshotIds: string[] = []
+    for (const candidate of [...candidates].reverse()) {
+      if (maintainsTable(candidate.changesMade, tableRef.tableId)) {
+        maintenanceSnapshotIds.push(candidate.snapshotId)
+        continue
+      }
+
+      const version = this.candidateToSnapshotRow(tableRef.datasetId, tableRef.tableId, candidate)
+      if (version) {
+        versions.push(version)
+      }
+    }
+
+    // Snapshot ids are consecutive, so a missing one was expired: it may have held a version.
+    const [count] = await runtime.query(`
+      SELECT count(*) AS snapshot_count
+      FROM ${duckLakeMetadataTableName(this.options, "ducklake_snapshot")}
+      WHERE snapshot_id >= ${fromSnapshotId} AND snapshot_id <= ${toSnapshotId}
+    `)
+    const expected = BigInt(toSnapshotId) - BigInt(fromSnapshotId) + 1n
+    const complete = count !== undefined && getBigIntLike(count, "snapshot_count") === expected
+
+    return { versions, maintenanceSnapshotIds, complete }
+  }
+
   private async getLatestSnapshotRowForTableRef(
     runtime: DuckDbQueryRuntime,
     tableRef: DatasetTableRef
@@ -985,6 +1049,9 @@ export class DuckLakeSnapshotReader {
     if (input.beforeSnapshotId !== undefined) {
       assertDuckLakeSnapshotId(input.beforeSnapshotId)
     }
+    if (input.fromSnapshotId !== undefined) {
+      assertDuckLakeSnapshotId(input.fromSnapshotId)
+    }
 
     const rows = await runtime.query(
       buildDuckLakeMetadataQuery(this.options, (table) => {
@@ -1003,6 +1070,9 @@ export class DuckLakeSnapshotReader {
         }
         if (input.beforeSnapshotId !== undefined) {
           bounds.push(`changes.snapshot_id < ${input.beforeSnapshotId}`)
+        }
+        if (input.fromSnapshotId !== undefined) {
+          bounds.push(`changes.snapshot_id >= ${input.fromSnapshotId}`)
         }
 
         const namesDatasetTable = datasetTableIds(input.table)

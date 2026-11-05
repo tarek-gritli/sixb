@@ -108,6 +108,15 @@ const MAINTENANCE_CHANGE_KINDS: ReadonlySet<string> = new Set([
   "merge_adjacent",
 ])
 
+/** Whether a DuckLake snapshot is a maintenance commit on the table (see MAINTENANCE_CHANGE_KINDS). */
+export function maintainsTable(changesMade: string, tableId: bigint): boolean {
+  const tableIdText = tableId.toString()
+  return changesMade.split(",").some((change) => {
+    const [kind, changedTableId] = change.split(":")
+    return changedTableId === tableIdText && MAINTENANCE_CHANGE_KINDS.has(kind.toLowerCase())
+  })
+}
+
 /**
  * Whether a DuckLake snapshot changed a table's rows, and whether it removed any. DuckLake records
  * every row change in `changes_made`, for inlined rows (`inlined_insert:<id>`) as for files

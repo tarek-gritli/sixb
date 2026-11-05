@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  maintainsTable,
   parseCommitMetadata,
   parseTableDataChange,
   parseVersionId,
@@ -145,6 +146,8 @@ describe("DuckLake version metadata", () => {
       parseTableDataChange("deleted_from_table:1,deleted_from_table:2,inline_flush:1", 1n)
     ).toEqual(none)
     expect(parseTableDataChange("merge_adjacent:3,rewrite_delete:3", 3n)).toEqual(none)
+    expect(maintainsTable("merge_adjacent:3,inserted_into_table:4", 3n)).toBe(true)
+    expect(maintainsTable("merge_adjacent:3,inserted_into_table:4", 4n)).toBe(false)
 
     // Only the maintained table: another table's rows changed in the same snapshot.
     expect(parseTableDataChange("inline_flush:1,deleted_from_table:2", 2n)).toEqual({
