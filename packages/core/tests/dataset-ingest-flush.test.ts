@@ -32,22 +32,28 @@ const contacts = defineDataset("source.contacts", {
   primaryKey: "id",
 })
 
+const documents = defineDataset("source.documents", {
+  schema: [col("id", "string"), col("file", "fileRef")],
+  primaryKey: "id",
+})
+
 afterEach(() => {
   jest.useRealTimers()
 })
 
 function setup(lakeStorage = new InMemoryLakeStorage()) {
   const storage = new InMemoryStorage()
+  const blobStorage = new InMemoryBlobStorage()
   const reports: SixbErrorContext[] = []
   const host = new SixbHost({
     id: "ingest-flush-test",
     ontology: [],
-    datasets: [people, contacts],
+    datasets: [people, contacts, documents],
     lakeStorage,
     broker: new InMemoryBroker(),
     storage,
     queues: new InMemoryQueues(),
-    blobStorage: new InMemoryBlobStorage(),
+    blobStorage,
     onError: (_error, context) => {
       reports.push(context)
     },
@@ -72,7 +78,19 @@ function setup(lakeStorage = new InMemoryLakeStorage()) {
     return reports
   }
 
-  return { host, storage, lakeStorage, sixb, scope, flush, ingest, committed, rows, reported }
+  return {
+    host,
+    storage,
+    lakeStorage,
+    blobStorage,
+    sixb,
+    scope,
+    flush,
+    ingest,
+    committed,
+    rows,
+    reported,
+  }
 }
 
 test("a flush writes every waiting delivery as one version, in delivery order", async () => {
@@ -219,6 +237,64 @@ test("a delivery the lake refuses is reported with what to send again, and the r
       sequence: "1",
     }),
   ])
+})
+
+test("a change that stopped being valid since ingest is refused, and the rest commits", async () => {
+  // Regression proof: refuse nothing in `mapValidationError` (return the error as it is); the
+  // flush fails on the deleted blob and writes nothing.
+  const { blobStorage, scope, flush, rows, reported } = setup()
+  const kept = await blobStorage.put({ body: new TextEncoder().encode("kept") })
+  const deleted = await blobStorage.put({ body: new TextEncoder().encode("deleted") })
+
+  const sender = scope()
+  await sender.datasets.ingest(documents, { changes: [change.upsert({ id: "1", file: kept })] })
+  const refused = await sender.datasets.ingest(documents, {
+    changes: [change.upsert({ id: "2", file: kept }), change.upsert({ id: "3", file: deleted })],
+  })
+
+  // The blob is deleted between ingest and flush.
+  const stat = blobStorage.stat.bind(blobStorage)
+  blobStorage.stat = async (blobId) => (blobId === deleted.blobId ? null : stat(blobId))
+
+  expect(await flush(documents)).toEqual({ kind: "flushed", versions: 1, deliveries: 1 })
+  expect((await rows(documents)).map((row) => row.id)).toEqual(["1"])
+
+  const rejected = (await reported()).filter((report) => report.type === "dataset.ingest.rejected")
+  expect(rejected).toEqual([
+    expect.objectContaining({
+      deliveryId: refused.deliveryId,
+      executionId: sender.execution.id,
+      changeIndex: 1,
+      key: { id: "3" },
+      failure: expect.objectContaining({ code: "dataset.change_refused" }),
+    }),
+  ])
+})
+
+test("a blob storage error at flush is retried, never refused", async () => {
+  // Regression proof: refuse every error in `mapValidationError`; the delivery is dropped and
+  // reported as refused although its blob exists.
+  const { blobStorage, ingest, flush, rows, reported, storage, host } = setup()
+  const file = await blobStorage.put({ body: new TextEncoder().encode("hello") })
+  await ingest(documents, change.upsert({ id: "1", file }))
+
+  const stat = blobStorage.stat.bind(blobStorage)
+  blobStorage.stat = async () => {
+    throw new Error("ECONNRESET")
+  }
+  const failed = await flush(documents).catch((error) => error)
+  blobStorage.stat = stat
+
+  expect(failed).toBeInstanceOf(DatasetIngestFlushError)
+  expect(await storage.datasetIngest.summarize({ projectId: host.id })).toMatchObject([
+    { datasetId: documents.id, pendingDeliveries: 1 },
+  ])
+
+  expect(await flush(documents)).toEqual({ kind: "flushed", versions: 1, deliveries: 1 })
+  expect((await rows(documents)).map((row) => row.id)).toEqual(["1"])
+  expect((await reported()).filter((report) => report.type === "dataset.ingest.rejected")).toEqual(
+    []
+  )
 })
 
 test("a flush that dies after its commit is resumed without writing its batch again", async () => {

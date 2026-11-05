@@ -21,6 +21,7 @@ import {
   DatasetIngestLeaseLostError,
   type DatasetIngestStorage,
 } from "../storage/dataset-ingest"
+import { DatasetValidationError } from "./errors"
 import type { DatasetDefinition } from "./types"
 import { writeDataset } from "./write"
 
@@ -241,7 +242,10 @@ class DatasetIngestFlush {
           producer,
           sourceLabel: `[Sixb] Dataset '${dataset.id}' ingested change`,
           readValues: async () => this.values(lease, batch.flushId),
-          mapValidationError: (error, value) => new RefusedChange(value, error),
+          // Only a change found invalid is refused. An error reading what it references, such as
+          // blob storage not answering, fails the attempt, which is retried.
+          mapValidationError: (error, value) =>
+            error instanceof DatasetValidationError ? new RefusedChange(value, error) : error,
         })
 
         return {
