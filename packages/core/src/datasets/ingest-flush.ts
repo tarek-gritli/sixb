@@ -6,7 +6,7 @@ import {
 } from "../error-reporting/capability"
 import { captureSixbFailure } from "../errors/internal"
 import type { DomainEventLog } from "../events/service"
-import { LakeConcurrencyError, LakeStorageError } from "../lake-storage/errors"
+import { LakeConcurrencyError, LakeValueRefusedError } from "../lake-storage/errors"
 import { getDatasetPrimaryKeyColumns } from "../lake-storage/merge-validation"
 import {
   DatasetSequenceConflictError,
@@ -594,13 +594,12 @@ class RefusedChange extends Error {
   }
 }
 
-/** An error the lake raises about the changes themselves, not about the write or its race. */
+/**
+ * The lake refusing a value of the changes, not failing itself: only this isolates and refuses
+ * deliveries. Any other error, its own state included, is an outage that is retried.
+ */
 function isLakeRefusal(error: unknown): boolean {
-  return (
-    error instanceof LakeStorageError &&
-    !(error instanceof LakeConcurrencyError) &&
-    !(error instanceof DatasetSequenceConflictError)
-  )
+  return error instanceof LakeValueRefusedError
 }
 
 function keyOf(dataset: DatasetDefinition, change: DatasetIngestChange): Record<string, string> {
