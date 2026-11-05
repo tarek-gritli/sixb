@@ -19,6 +19,7 @@ import { writeDataset } from "../src/datasets/write"
 import { flushSixbErrors } from "../src/error-reporting/capability"
 import { buildEventSelectorPredicate } from "../src/events"
 import { createTestingScope } from "../src/execution/scopes"
+import { LakeStorageError } from "../src/lake-storage/errors"
 import { DatasetIngestFlushError, getDatasetIngestRuntime } from "../src/runtime/internal"
 
 const people = defineDataset("source.people", {
@@ -40,6 +41,37 @@ const documents = defineDataset("source.documents", {
 afterEach(() => {
   jest.useRealTimers()
 })
+
+/**
+ * A lake that cannot hold some values core validation accepts, as DuckLake's DECIMAL(38,9) refuses
+ * a decimal with ten fractional digits: it refuses a name for which `refuses` is true, as it stages.
+ */
+class RefusingLakeStorage extends InMemoryLakeStorage {
+  constructor(private readonly refuses: (name: unknown) => boolean) {
+    super()
+  }
+
+  override async beginMerge(input: Parameters<InMemoryLakeStorage["beginMerge"]>[0]) {
+    const session = await super.beginMerge(input)
+    const writeChanges = session.writeChanges.bind(session)
+    const refuses = this.refuses
+
+    session.writeChanges = async (changes) => {
+      const accepted: MergeChange<DatasetRow, DatasetRow>[] = []
+      for await (const change of changes) {
+        if (change.kind === "upsert" && refuses(change.row.name)) {
+          throw new LakeStorageError(
+            `[TestLake] Column 'name' cannot hold '${String(change.row.name)}' exactly.`
+          )
+        }
+        accepted.push(change)
+      }
+      await writeChanges(accepted)
+    }
+
+    return session
+  }
+}
 
 function setup(lakeStorage = new InMemoryLakeStorage()) {
   const storage = new InMemoryStorage()
@@ -296,6 +328,60 @@ test("a change that stopped being valid since ingest is refused, and the rest co
       failure: expect.objectContaining({ code: "dataset.change_refused" }),
     }),
   ])
+})
+
+test("a delivery holding a value the lake cannot hold is refused, and the rest commits", async () => {
+  // Regression proof: rethrow without `isolate` in `commit`; every attempt fails on the whole
+  // batch, and no delivery of the dataset is written again.
+  const { scope, ingest, flush, rows, reported } = setup(
+    new RefusingLakeStorage((name) => name === "1.0000000001")
+  )
+  await ingest(contacts, change.upsert({ id: "1", name: "ok" }))
+  const sender = scope()
+  const refused = await sender.datasets.ingest(contacts, {
+    changes: [
+      change.upsert({ id: "2", name: "fine" }),
+      change.upsert({ id: "3", name: "1.0000000001" }),
+    ],
+  })
+  await ingest(contacts, change.upsert({ id: "4", name: "later" }))
+
+  expect(await flush(contacts)).toEqual({ kind: "flushed", versions: 1, deliveries: 2 })
+  expect((await rows(contacts)).map((row) => row.name)).toEqual(["ok", "later"])
+
+  const rejected = (await reported()).filter((report) => report.type === "dataset.ingest.rejected")
+  expect(rejected).toEqual([
+    expect.objectContaining({
+      deliveryId: refused.deliveryId,
+      executionId: sender.execution.id,
+      changeIndex: 1,
+      key: { id: "3" },
+      failure: expect.objectContaining({ code: "dataset.change_refused" }),
+    }),
+  ])
+
+  // A lone delivery the lake refuses is refused as well.
+  await ingest(contacts, change.upsert({ id: "5", name: "1.0000000001" }))
+  expect(await flush(contacts)).toEqual({ kind: "flushed", versions: 0, deliveries: 0 })
+  expect(
+    (await reported()).filter((report) => report.type === "dataset.ingest.rejected")
+  ).toHaveLength(2)
+})
+
+test("a lake that refuses every delivery is failing: nothing is refused, and it is retried", async () => {
+  // Regression proof: refuse every delivery `isolate` finds, even when all of a batch are; the
+  // outage drops both.
+  const { ingest, flush, reported, storage, host } = setup(new RefusingLakeStorage(() => true))
+  await ingest(contacts, change.upsert({ id: "1", name: "a" }))
+  await ingest(contacts, change.upsert({ id: "2", name: "b" }))
+
+  expect(await flush(contacts).catch((error) => error)).toBeInstanceOf(DatasetIngestFlushError)
+  expect(await storage.datasetIngest.summarize({ projectId: host.id })).toMatchObject([
+    { datasetId: contacts.id, pendingDeliveries: 2 },
+  ])
+  expect((await reported()).filter((report) => report.type === "dataset.ingest.rejected")).toEqual(
+    []
+  )
 })
 
 test("a blob storage error at flush is retried, never refused", async () => {

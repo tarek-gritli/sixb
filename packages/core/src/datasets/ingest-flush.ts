@@ -6,7 +6,7 @@ import {
 } from "../error-reporting/capability"
 import { captureSixbFailure } from "../errors/internal"
 import type { DomainEventLog } from "../events/service"
-import { LakeConcurrencyError } from "../lake-storage/errors"
+import { LakeConcurrencyError, LakeStorageError } from "../lake-storage/errors"
 import { getDatasetPrimaryKeyColumns } from "../lake-storage/merge-validation"
 import {
   DatasetSequenceConflictError,
@@ -23,7 +23,7 @@ import {
 } from "../storage/dataset-ingest"
 import { DatasetValidationError } from "./errors"
 import type { DatasetDefinition } from "./types"
-import { writeDataset } from "./write"
+import { lakeDatasetDefinition, writeDataset } from "./write"
 
 /** How long a flush holds a dataset without renewing. A holder that dies frees it after this. */
 const LEASE_MS = 60_000
@@ -268,9 +268,100 @@ class DatasetIngestFlush {
           continue
         }
 
+        // A value the lake cannot hold, such as a decimal past its precision, would otherwise
+        // fail the batch on every attempt: find the deliveries it comes from.
+        const isolated = isLakeRefusal(error)
+          ? await this.isolate(dataset, lease, batch, producer)
+          : []
+
+        if (isolated.length > 0) {
+          for (const refused of isolated) {
+            await this.reject(dataset, lease, batch, refused)
+          }
+          const ids = new Set(isolated.map((refused) => refused.value.delivery.id))
+          deliveries = deliveries.filter((delivery) => !ids.has(delivery.id))
+          continue
+        }
+
         throw error
       }
     }
+  }
+
+  /**
+   * The deliveries the lake refuses when it stages each one alone, each with its first refused
+   * change. Staging writes nothing: the merge is abandoned.
+   *
+   * A lone delivery the lake refuses is refused too, or one bad value would block the dataset.
+   * When every delivery of a larger batch is refused, the lake is failing, not the changes: none
+   * is refused, and the attempt fails to be retried.
+   */
+  private async isolate(
+    dataset: DatasetDefinition,
+    lease: DatasetIngestLease,
+    batch: DatasetIngestBatch,
+    producer: DatasetProducer
+  ): Promise<RefusedChange[]> {
+    const refused: RefusedChange[] = []
+    let staged = 0
+
+    for await (const { delivery, changes } of this.inbox.readChanges({
+      lease,
+      flushId: batch.flushId,
+    })) {
+      staged += 1
+      const error = await this.stage(dataset, producer, changes)
+      if (error === null) continue
+
+      const changeIndex = await this.firstRefusedChange(dataset, producer, changes)
+      const value = changes[changeIndex] ?? changes[0]
+      if (value) refused.push(new RefusedChange({ value, delivery, changeIndex }, error))
+    }
+
+    if (staged > 1 && refused.length === staged) return []
+    return refused
+  }
+
+  /** The lake's refusal of these changes, staged in a merge it then abandons; null if it accepts. */
+  private async stage(
+    dataset: DatasetDefinition,
+    producer: DatasetProducer,
+    changes: readonly DatasetIngestChange[]
+  ): Promise<unknown> {
+    const session = await this.dependencies.lakeStorage.beginMerge({
+      dataset: lakeDatasetDefinition(dataset),
+      producer,
+    })
+
+    try {
+      await session.writeChanges(changes)
+      return null
+    } catch (error) {
+      if (isLakeRefusal(error)) return error
+      throw error
+    } finally {
+      await session.abort().catch(() => {})
+    }
+  }
+
+  /** The refused change: the end of the shortest prefix of the delivery the lake refuses. */
+  private async firstRefusedChange(
+    dataset: DatasetDefinition,
+    producer: DatasetProducer,
+    changes: readonly DatasetIngestChange[]
+  ): Promise<number> {
+    let low = 0
+    let high = changes.length - 1
+
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2)
+      const refused = await this.stage(dataset, producer, changes.slice(0, middle + 1))
+
+      if (refused === null) low = middle + 1
+      else high = middle
+    }
+
+    return low
   }
 
   /** The batch's changes, in inbox order, each with where it came from. */
@@ -483,6 +574,15 @@ class RefusedChange extends Error {
   ) {
     super(cause instanceof Error ? cause.message : String(cause), { cause })
   }
+}
+
+/** An error the lake raises about the changes themselves, not about the write or its race. */
+function isLakeRefusal(error: unknown): boolean {
+  return (
+    error instanceof LakeStorageError &&
+    !(error instanceof LakeConcurrencyError) &&
+    !(error instanceof DatasetSequenceConflictError)
+  )
 }
 
 function keyOf(dataset: DatasetDefinition, change: DatasetIngestChange): Record<string, string> {
