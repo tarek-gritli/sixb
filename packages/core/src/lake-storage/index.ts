@@ -46,6 +46,7 @@ export {
 export type { DatasetSequenceChange, DatasetSequenceState } from "./source-ordering"
 export {
   assertUnsequencedDatasetWrite,
+  DatasetSequenceConflictError,
   datasetSequenceChange,
   isSequenceOnlyChange,
   reconcileDatasetSequences,
