@@ -5,12 +5,14 @@ import {
   bindDurablePrimitiveExecution,
   type PrimitiveExecutionHost,
 } from "@sixb/core/internal/primitive-execution"
+import { getLakeRetentionRuntime } from "@sixb/core/internal/runtime"
 import { resolveSyncConnectorSources } from "@sixb/core/internal/syncs"
 import type { QueueWorkerFailureDecision } from "@sixb/core/internal/workers"
 import { QueueWorker } from "@sixb/core/internal/workers"
 import type { DatasetVersion } from "@sixb/core/lake-storage"
 import type { ClaimedQueueJob, SyncRunRequestedQueueJob } from "@sixb/core/queues"
 import { SYNC_RUN_FAILURE_CODES, type SyncRunRecord, type SyncRunStatus } from "@sixb/core/storage"
+import { LakeWorker } from "./lake-worker"
 import { runSyncJob, SyncRunAlreadyStartedError } from "./run-sync-job"
 import type { SyncWorkerContext } from "./types"
 
@@ -35,10 +37,14 @@ export class SyncWorker extends QueueWorker<
   typeof SYNC_RUN_FAILURE_CODES
 > {
   private readonly host: SyncWorkerHost
+  private readonly lakeWorker?: LakeWorker
 
   constructor(host: SyncWorkerHost, options: SyncWorkerOptions = {}) {
-    if (host.definitions.syncs.list().length === 0) {
-      throw new Error("[SixbSyncWorker] No sync definitions are registered.")
+    const lakeRetention = getLakeRetentionRuntime(host).scheduled
+    if (host.definitions.syncs.list().length === 0 && !lakeRetention) {
+      throw new Error(
+        "[SixbSyncWorker] No sync definitions are registered, and lake retention is not scheduled."
+      )
     }
 
     super({
@@ -51,6 +57,19 @@ export class SyncWorker extends QueueWorker<
 
     assertSyncStorage(host)
     this.host = host
+    if (lakeRetention) this.lakeWorker = new LakeWorker(host)
+  }
+
+  override async start(): Promise<void> {
+    await Promise.all([super.start(), this.lakeWorker?.start()])
+  }
+
+  override async stop(): Promise<void> {
+    await Promise.all([super.stop(), this.lakeWorker?.stop()])
+  }
+
+  override async wait(): Promise<void> {
+    await Promise.all([super.wait(), this.lakeWorker?.wait()])
   }
 
   protected async execute(
