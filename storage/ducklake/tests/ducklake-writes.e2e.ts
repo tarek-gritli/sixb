@@ -712,6 +712,47 @@ describe("DuckLakeStorage keyed snapshot writes", () => {
     )
   }, 30_000)
 
+  // Regression proof: make the write coordinator's expectsReplacement return false. The first
+  // write after the replacement then compares its rows and writes only the one that changed. Or
+  // drop its LARGE_TABLE_ROWS bound: the small table's write then replaces every row.
+  test("replaces every row of a large table without comparing them after a replacement, and compares every 8th", async () => {
+    await storage.createDataset(accounts)
+    let rows = accountRows(100_000)
+    let latest = (await guardedSnapshot(accounts, rows, null)).versionId
+
+    // Every row changes: a replacement, compared with the table first.
+    rows = rescored(rows, 100_000, 1)
+    latest = (await guardedSnapshot(accounts, rows, latest)).versionId
+    expect(await feedOf(accounts, latest)).toEqual({ delete: 100_000, insert: 100_000 })
+
+    // Then one row changes per write: seven replacements without comparing, then a difference.
+    const feeds = []
+    for (let write = 1; write <= 9; write++) {
+      rows = rows.map((row) => (row.id === `a${write}` ? { ...row, name: "renamed" } : row))
+      latest = (await guardedSnapshot(accounts, rows, latest)).versionId
+      feeds.push(await feedOf(accounts, latest))
+    }
+    expect(await sortedRows(accounts, latest)).toEqual(readRows(rows))
+
+    const replaced = { delete: 100_000, insert: 100_000 }
+    const changed = { delete: 1, insert: 1 }
+    expect(feeds).toEqual([...Array(7).fill(replaced), changed, changed])
+
+    // In a smaller table, a difference may insert and delete more rows than the table holds.
+    const small = defineDataset("crm.small_accounts", {
+      schema: accounts.schema.columns,
+      primaryKey: "id",
+    })
+    await storage.createDataset(small)
+    let smallRows = accountRows(1_000)
+    let smallLatest = (await guardedSnapshot(small, smallRows, null)).versionId
+    smallRows = rescored(smallRows, 1_000, 1)
+    smallLatest = (await guardedSnapshot(small, smallRows, smallLatest)).versionId
+    smallRows = smallRows.map((row) => (row.id === "a1" ? { ...row, name: "renamed" } : row))
+    smallLatest = (await guardedSnapshot(small, smallRows, smallLatest)).versionId
+    expect(await feedOf(small, smallLatest)).toEqual(changed)
+  }, 60_000)
+
   // Regression proof: in applyKeyedSnapshot, drop the delete or the insert statement. The
   // shrinking or the growing write then keeps rows it removed, or loses rows it added.
   test("writes a snapshot that only adds or only removes rows", async () => {
@@ -794,6 +835,17 @@ describe("DuckLakeStorage keyed snapshot writes", () => {
     const write = await storage.beginWrite({ dataset, mode: "snapshot" })
     await write.writeRows(rows)
     return write.commit()
+  }
+
+  /** A snapshot guarded on the version it builds on, as pipeline steps write. */
+  async function guardedSnapshot(
+    dataset: DatasetDefinition,
+    rows: readonly DatasetRow[],
+    expectedLatestVersionId: string | null
+  ) {
+    const write = await storage.beginWrite({ dataset, mode: "snapshot" })
+    await write.writeRows(rows)
+    return write.commit({ expectedLatestVersionId })
   }
 
   async function sortedRows(dataset: DatasetDefinition, versionId: string) {

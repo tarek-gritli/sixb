@@ -90,6 +90,8 @@ export async function applyDatasetRowsFromRelation(input: {
   /** Provider-rendered relation SQL, such as a quoted staging or temp table. */
   readonly sourceRelationSql: string
   readonly previousRowCount?: number
+  /** A keyed snapshot replaces every row without comparing them first (see the coordinator). */
+  readonly expectReplacement?: boolean
 }): Promise<ApplyDatasetRowsResult> {
   const tableName = encodeDatasetTableName(input.dataset.id)
   const table = qualifiedTableName(input.options, tableName)
@@ -124,7 +126,7 @@ export async function applyDatasetRowsFromRelation(input: {
   }
 
   if (input.mode === "snapshot") {
-    if (primaryKeyColumns !== null && sourceRowCount !== undefined) {
+    if (primaryKeyColumns !== null && sourceRowCount !== undefined && !input.expectReplacement) {
       return applyKeyedSnapshot({
         runtime: input.runtime,
         dataset: input.dataset,

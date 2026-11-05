@@ -113,6 +113,7 @@ export interface DuckLakeVersionSummary {
   readonly inputs?: readonly DatasetVersionRef[]
   readonly lineage?: DatasetVersionLineage
   readonly rowCount?: number
+  readonly rowChanges?: number
   readonly validatedPrimaryKeyColumns?: readonly string[]
 }
 
@@ -771,6 +772,7 @@ export class DuckLakeSnapshotReader {
       inputs: row.metadata?.inputs,
       ...storedLineage(tableRef.datasetId, row),
       ...(row.metadata?.rowCount !== undefined ? { rowCount: row.metadata.rowCount } : {}),
+      ...(row.metadata?.rowChanges !== undefined ? { rowChanges: row.metadata.rowChanges } : {}),
       ...(row.metadata?.validatedPrimaryKeyColumns !== undefined
         ? { validatedPrimaryKeyColumns: row.metadata.validatedPrimaryKeyColumns }
         : {}),

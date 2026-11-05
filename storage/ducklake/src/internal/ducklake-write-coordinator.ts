@@ -28,6 +28,7 @@ import {
   applyDatasetRowsFromRelation,
   assertDatasetWriteMode,
   type CommitRowCount,
+  LARGE_TABLE_ROWS,
 } from "./dataset-row-commit"
 import { applyDatasetMergeFromRelation } from "./dataset-row-merge"
 import { getBigIntLike } from "./duckdb-row"
@@ -86,7 +87,18 @@ interface DuckLakeCommitVersionOutcomeRuntimeInput extends DuckLakeCommitVersion
 export interface DuckLakeApplyChangesContext {
   readonly previousRowCount?: number
   readonly validatedPrimaryKeyColumns?: readonly string[]
+  /**
+   * The snapshot is expected to replace every row, as the version it builds on did: it replaces
+   * them without the join that would find which rows changed (see `expectsReplacement`).
+   */
+  readonly expectReplacement: boolean
 }
+
+/**
+ * A keyed snapshot over a version that replaced every row skips comparing its rows this many
+ * times in a row, then compares them again in case far fewer change now.
+ */
+const RECHECK_REPLACEMENT_EVERY = 8
 
 /**
  * Owns the durable DuckLake transaction for a staged Sixb write.
@@ -105,6 +117,9 @@ export class DuckLakeWriteCoordinator {
     /** Told about each commit that created a version, once it has. Must not wait or throw. */
     private readonly versionCreated: (dataset: DatasetDefinition) => void
   ) {}
+
+  /** Per dataset, the keyed snapshots in a row written as replacements without comparing rows. */
+  private readonly uncomparedReplacements = new Map<string, number>()
 
   async beginWrite(input: BeginDatasetWriteInput): Promise<LakeWriteSession> {
     this.connections.assertOpen()
@@ -196,6 +211,7 @@ export class DuckLakeWriteCoordinator {
             ...input,
             runtime: commitRuntime,
             previousRowCount: context.previousRowCount,
+            expectReplacement: context.expectReplacement,
           }),
       })
     )
@@ -346,6 +362,7 @@ export class DuckLakeWriteCoordinator {
       const changeResult = await input.applyChanges(input.runtime, {
         previousRowCount: latestVersion?.rowCount,
         validatedPrimaryKeyColumns: latestVersion?.validatedPrimaryKeyColumns,
+        expectReplacement: this.expectsReplacement(input, latestVersion),
       })
       input.signal?.throwIfAborted()
 
@@ -480,6 +497,7 @@ export class DuckLakeWriteCoordinator {
     input: DuckLakeCommitWriteInput & {
       readonly runtime: DuckDbQueryRuntime
       readonly previousRowCount?: number
+      readonly expectReplacement: boolean
     }
   ): Promise<ApplyDatasetRowsResult> {
     const mode = input.write.mode ?? "snapshot"
@@ -490,6 +508,7 @@ export class DuckLakeWriteCoordinator {
       mode,
       sourceRelationSql: quoteIdentifier(input.stagingTableName),
       previousRowCount: input.previousRowCount,
+      expectReplacement: input.expectReplacement,
     })
 
     if (result.sourceRowCount !== input.rowsWritten) {
@@ -562,6 +581,36 @@ export class DuckLakeWriteCoordinator {
     const descriptionSql =
       input.dataset.description === undefined ? "NULL" : quoteSqlString(input.dataset.description)
     await input.runtime.run(`COMMENT ON TABLE ${table} IS ${descriptionSql}`)
+  }
+
+  /**
+   * Whether a keyed snapshot should replace every row without first joining them with the table.
+   * The join finds which rows changed, so that a few changed rows are all that is written; when
+   * most rows change, it is a cost on top of the replacement that follows (a tenth of the write
+   * with a million rows). In a large table (`LARGE_TABLE_ROWS`), a version that replaced the rows
+   * of a non-empty table inserted and deleted more rows than it holds, which a difference never
+   * does: its next snapshot is expected to replace them too. Every `RECHECK_REPLACEMENT_EVERY`th
+   * one compares again.
+   */
+  private expectsReplacement(
+    input: DuckLakeCommitVersionOutcomeRuntimeInput,
+    parent: DuckLakeVersionSummary | null | undefined
+  ): boolean {
+    const replaced =
+      input.mode === "snapshot" &&
+      parent?.rowChanges !== undefined &&
+      parent.rowCount !== undefined &&
+      parent.rowCount >= LARGE_TABLE_ROWS &&
+      parent.rowChanges > parent.rowCount
+
+    const streak = this.uncomparedReplacements.get(input.dataset.id) ?? 0
+    if (!replaced || streak + 1 >= RECHECK_REPLACEMENT_EVERY) {
+      this.uncomparedReplacements.delete(input.dataset.id)
+      return false
+    }
+
+    this.uncomparedReplacements.set(input.dataset.id, streak + 1)
+    return true
   }
 
   /** A commit that changes no rows still creates a version for a first version or new provenance. */
