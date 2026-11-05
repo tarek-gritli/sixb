@@ -18,7 +18,6 @@ import {
   type SyncDefinition,
 } from "@sixb/core"
 import type { LakeMaintenance, LakeRetentionReport } from "@sixb/core/lake-storage"
-import { createTestSixb } from "@sixb/core/testing"
 import { SyncWorker } from "../src"
 
 const Room = defineObjectType({
@@ -109,8 +108,13 @@ function createHost(
   return { sixb, lakeStorage, queues }
 }
 
+/** Stores a delivery as `ingest` does, leaving its flush to the worker under test. */
 async function ingestPerson(sixb: SixbHost, id: string) {
-  await createTestSixb(sixb).datasets.ingest(people, {
+  await sixb.storage.datasetIngest?.append({
+    projectId: PROJECT_ID,
+    datasetId: people.id,
+    executionId: `exec-${id}`,
+    correlationId: `corr-${id}`,
     changes: [change.upsert({ id, name: `Person ${id}` })],
   })
 }
@@ -333,9 +337,11 @@ describe("SyncWorker lake lane", () => {
     expect(errors).toEqual([])
   })
 
-  // Reproduce: complete the job when the flush answers "busy"; the delivery then waits for a
-  // request no job serves.
-  test("waits for another flush's lease instead of failing or reporting", async () => {
+  // Reproduce: complete the job when the flush answers "busy", and the delivery waits for a
+  // request no job serves; or retry it when the other lease expires, and it waits up to a minute
+  // after that flush has finished.
+  test("tries again within a second when another flush holds the dataset", async () => {
+    jest.useFakeTimers()
     const errors: SixbErrorContext[] = []
     const { sixb, lakeStorage, queues } = createHost({ ingest: true, errors })
     const retried: string[] = []
@@ -346,7 +352,8 @@ describe("SyncWorker lake lane", () => {
     }
 
     await ingestPerson(sixb, "1")
-    const held = await sixb.storage.datasetIngest!.acquire({
+    const inbox = sixb.storage.datasetIngest!
+    const held = await inbox.acquire({
       projectId: PROJECT_ID,
       datasetId: people.id,
       owner: "another-worker",
@@ -358,8 +365,14 @@ describe("SyncWorker lake lane", () => {
     await enqueueFlush(queues, 0)
 
     await eventually(() => retried.length === 1)
-    expect(retried[0]).toBe(held.lease.expiresAt.toISOString())
+    expect(Date.parse(retried[0]!) - Date.now()).toBe(1_000)
     expect(await lakeStorage.listVersions(people.id)).toEqual([])
+
+    // The other flush finishes long before its lease would expire.
+    await inbox.release({ lease: held.lease })
+    jest.advanceTimersByTime(1_000)
+
+    await eventuallyAsync(async () => (await lakeStorage.listVersions(people.id)).length === 1)
     expect(errors).toEqual([])
   })
 

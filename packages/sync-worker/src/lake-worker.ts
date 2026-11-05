@@ -35,6 +35,12 @@ const RETENTION_RETRY_DELAY_MS = 60_000
  */
 const FLUSH_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000, 60_000] as const
 
+/**
+ * A flush that finds the dataset held tries again this soon, not when the holder's lease would
+ * expire: the holder releases it as soon as it is done, often long before.
+ */
+const BUSY_RETRY_MS = 1_000
+
 export interface LakeWorkerHost {
   readonly id: string
   readonly queues: Pick<Queues, "lake">
@@ -141,13 +147,12 @@ export class LakeWorker extends QueueWorker<LakeQueueJob, typeof FAILURE_CODES> 
     error: unknown
   ): QueueWorkerFailureDecision<(typeof FAILURE_CODES)[number]> {
     if (error instanceof DatasetIngestFlushBusy) {
-      return { kind: "retry", availableAt: error.until.toISOString() }
+      const soon = Math.min(error.until.getTime(), Date.now() + BUSY_RETRY_MS)
+      return { kind: "retry", availableAt: new Date(soon).toISOString() }
     }
 
     const failures = error instanceof DatasetIngestFlushError ? error.failureStreak : job.attempt
-    const delayMs =
-      FLUSH_RETRY_DELAYS_MS[Math.min(Math.max(failures, 1), FLUSH_RETRY_DELAYS_MS.length) - 1] ??
-      FLUSH_RETRY_DELAYS_MS[0]
+    const delayMs = flushRetryDelay(failures)
 
     console.warn(
       `[SixbSyncWorker] Flushing the ingested changes of dataset '${job.payload.datasetId}' failed; retrying in ${delayMs / 1_000} s.`,
@@ -155,6 +160,14 @@ export class LakeWorker extends QueueWorker<LakeQueueJob, typeof FAILURE_CODES> 
     )
     return { kind: "retry", availableAt: inMs(delayMs) }
   }
+}
+
+/** The pause after `failures` failed flushes in a row: the delays in turn, then the last one. */
+function flushRetryDelay(failures: number): number {
+  const last = FLUSH_RETRY_DELAYS_MS.length - 1
+  const index = Math.min(Math.max(failures - 1, 0), last)
+
+  return FLUSH_RETRY_DELAYS_MS[index] ?? FLUSH_RETRY_DELAYS_MS[last]
 }
 
 function inMs(delayMs: number): string {

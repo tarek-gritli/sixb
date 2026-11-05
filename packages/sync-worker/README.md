@@ -80,7 +80,8 @@ A `dataset.ingest.flush.requested` job flushes one dataset's ingested changes th
 
 - Its id names the flush request (`ingest-flush:<dataset>:<request>`), so the deliveries of one
   request queue one job.
-- When another flush holds the dataset, the job retries when that lease would expire.
+- When another flush holds the dataset, the job tries again a second later, until that flush
+  releases it.
 - A failure retries after 1, 2, 5, 15 and 30 s, then every minute, and the job never fails: the
   changes stay in the inbox, and the next attempt resumes the batch in flight. The flush reports
   the fifth failure in a row as `dataset.ingest.flush.failed`.
