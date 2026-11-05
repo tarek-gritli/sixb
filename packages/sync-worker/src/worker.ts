@@ -13,7 +13,7 @@ import {
   bindDurablePrimitiveExecution,
   type PrimitiveExecutionHost,
 } from "@sixb/core/internal/primitive-execution"
-import { getLakeRetentionRuntime } from "@sixb/core/internal/runtime"
+import { getDatasetIngestRuntime, getLakeRetentionRuntime } from "@sixb/core/internal/runtime"
 import { resolveSyncConnectorSources } from "@sixb/core/internal/syncs"
 import type { QueueWorkerFailureDecision } from "@sixb/core/internal/workers"
 import { QueueWorker, retryUnstartedRun } from "@sixb/core/internal/workers"
@@ -53,10 +53,12 @@ export class SyncWorker extends QueueWorker<
   private readonly lakeWorker?: LakeWorker
 
   constructor(host: SyncWorkerHost, options: SyncWorkerOptions = {}) {
-    const lakeRetention = getLakeRetentionRuntime(host).scheduled
-    if (host.definitions.syncs.list().length === 0 && !lakeRetention) {
+    // The lake lane runs retention and the flushes of ingested changes.
+    const lakeWork =
+      getLakeRetentionRuntime(host).scheduled || getDatasetIngestRuntime(host).enabled
+    if (host.definitions.syncs.list().length === 0 && !lakeWork) {
       throw new Error(
-        "[SixbSyncWorker] No sync definitions are registered, and lake retention is not scheduled."
+        "[SixbSyncWorker] No sync definitions are registered, lake retention is not scheduled, and no dataset can be ingested."
       )
     }
 
@@ -70,7 +72,7 @@ export class SyncWorker extends QueueWorker<
 
     assertSyncStorage(host)
     this.host = host
-    if (lakeRetention) this.lakeWorker = new LakeWorker(host)
+    if (lakeWork) this.lakeWorker = new LakeWorker(host)
   }
 
   override async start(): Promise<void> {

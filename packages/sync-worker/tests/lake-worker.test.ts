@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, jest, test } from "bun:test"
 import {
+  change,
   col,
   defineConnector,
   defineDataset,
@@ -17,6 +18,7 @@ import {
   type SyncDefinition,
 } from "@sixb/core"
 import type { LakeMaintenance, LakeRetentionReport } from "@sixb/core/lake-storage"
+import { createTestSixb } from "@sixb/core/testing"
 import { SyncWorker } from "../src"
 
 const Room = defineObjectType({
@@ -26,6 +28,11 @@ const Room = defineObjectType({
 })
 
 const rooms = defineDataset("raw.rooms", { schema: [col("id", "string")] })
+
+const people = defineDataset("raw.people", {
+  schema: [col("id", "string"), col("name", "string")],
+  primaryKey: "id",
+})
 
 const erpDb = defineConnector("erpDb", {
   type: "sql",
@@ -74,6 +81,7 @@ afterEach(async () => {
 function createHost(
   input: {
     syncs?: SyncDefinition[]
+    ingest?: boolean
     lakeMaintenance?: LakeMaintenanceOptions
     errors?: SixbErrorContext[]
   } = {}
@@ -84,7 +92,7 @@ function createHost(
   const sixb = new SixbHost({
     id: PROJECT_ID,
     ontology: [Room],
-    datasets: [rooms],
+    datasets: input.ingest ? [rooms, people] : [rooms],
     connectors: [erpDb],
     syncs: input.syncs ?? [],
     broker: new InMemoryBroker(),
@@ -99,6 +107,25 @@ function createHost(
   })
 
   return { sixb, lakeStorage, queues }
+}
+
+async function ingestPerson(sixb: SixbHost, id: string) {
+  await createTestSixb(sixb).datasets.ingest(people, {
+    changes: [change.upsert({ id, name: `Person ${id}` })],
+  })
+}
+
+async function enqueueFlush(queues: InMemoryQueues, request: number) {
+  await queues.lake.enqueue({
+    projectId: PROJECT_ID,
+    jobs: [
+      {
+        id: `ingest-flush:${people.id}:${request}`,
+        type: "dataset.ingest.flush.requested",
+        payload: { datasetId: people.id },
+      },
+    ],
+  })
 }
 
 async function start(sixb: SixbHost, options?: ConstructorParameters<typeof SyncWorker>[1]) {
@@ -157,6 +184,15 @@ async function eventually(predicate: () => boolean, turns = 500): Promise<void> 
   throw new Error("Condition not reached.")
 }
 
+/** As `eventually`, for a condition read from storage. */
+async function eventuallyAsync(predicate: () => Promise<boolean>, turns = 500): Promise<void> {
+  for (let turn = 0; turn < turns; turn += 1) {
+    if (await predicate()) return
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
+  throw new Error("Condition not reached.")
+}
+
 async function quietly<T>(run: () => Promise<T>): Promise<T> {
   const warn = console.warn
   console.warn = () => {}
@@ -183,7 +219,7 @@ describe("SyncWorker lake lane", () => {
     const { sixb } = createHost({ lakeMaintenance: { enabled: false } })
 
     expect(() => new SyncWorker(sixb)).toThrow(
-      "[SixbSyncWorker] No sync definitions are registered, and lake retention is not scheduled."
+      "[SixbSyncWorker] No sync definitions are registered, lake retention is not scheduled, and no dataset can be ingested."
     )
   })
 
@@ -214,17 +250,117 @@ describe("SyncWorker lake lane", () => {
     releaseSync()
   })
 
-  // Reproduce: set LAKE_CONCURRENCY to 1 in lake-worker.ts.
-  test("runs two lake jobs at once", async () => {
-    const { sixb, lakeStorage, queues } = createHost()
+  // Reproduce: set LAKE_CONCURRENCY to 1 in lake-worker.ts, and the flush waits behind the pass;
+  // or run `runRetention` without `retentionTail`, and the second pass starts at once.
+  test("flushes ingested changes while a retention pass runs, and runs one pass at a time", async () => {
+    const { sixb, lakeStorage, queues } = createHost({ ingest: true })
     await start(sixb)
     const now = Date.now()
 
     await enqueueRetention(queues, new Date(now - MINUTE).toISOString())
     await enqueueRetention(queues, new Date(now).toISOString())
+    await eventually(() => lakeStorage.passes.length === 1)
 
+    await ingestPerson(sixb, "1")
+    await enqueueFlush(queues, 0)
+    await eventuallyAsync(async () => (await lakeStorage.listVersions(people.id)).length === 1)
+
+    // The second pass starts only once the first is settled.
+    await eventually(() => false, 50).catch(() => {})
+    expect(lakeStorage.passes).toHaveLength(1)
+    lakeStorage.passes[0]!.resolve()
     await eventually(() => lakeStorage.passes.length === 2)
-    for (const pass of lakeStorage.passes) pass.resolve()
+    lakeStorage.passes[1]!.resolve()
+  })
+
+  // Reproduce: keep the refusal for projects without syncs or retention in SyncWorker's constructor.
+  test("starts for a dataset that can be ingested, without syncs or retention", async () => {
+    const { sixb, lakeStorage, queues } = createHost({
+      ingest: true,
+      lakeMaintenance: { enabled: false },
+    })
+    await start(sixb)
+
+    await ingestPerson(sixb, "1")
+    await enqueueFlush(queues, 0)
+
+    await eventuallyAsync(async () => (await lakeStorage.listVersions(people.id)).length === 1)
+  })
+
+  // Reproduce: return `{ kind: "fail" }` from `retryFlush` in lake-worker.ts.
+  test("retries a failing flush sooner at first, and never fails its job", async () => {
+    jest.useFakeTimers()
+    const errors: SixbErrorContext[] = []
+    const { sixb, lakeStorage, queues } = createHost({ ingest: true, errors })
+    const retried: string[] = []
+    const retry = queues.lake.retry.bind(queues.lake)
+    queues.lake.retry = async (input) => {
+      retried.push(input.availableAt ?? "now")
+      await retry(input)
+    }
+    const fail = queues.lake.fail.bind(queues.lake)
+    let failed = 0
+    queues.lake.fail = async (input) => {
+      failed += 1
+      await fail(input)
+    }
+
+    const beginMerge = lakeStorage.beginMerge.bind(lakeStorage)
+    let offline = true
+    lakeStorage.beginMerge = async (input) => {
+      if (offline) throw new Error("lake offline")
+      return beginMerge(input)
+    }
+
+    await start(sixb)
+    await ingestPerson(sixb, "1")
+
+    await quietly(async () => {
+      await enqueueFlush(queues, 0)
+      await eventually(() => retried.length === 1)
+      expect(Date.parse(retried[0]!) - Date.now()).toBe(1_000)
+
+      jest.advanceTimersByTime(1_000)
+      await eventually(() => retried.length === 2)
+      expect(Date.parse(retried[1]!) - Date.now()).toBe(2_000)
+
+      offline = false
+      jest.advanceTimersByTime(2_000)
+      await eventuallyAsync(async () => (await lakeStorage.listVersions(people.id)).length === 1)
+    })
+
+    expect(failed).toBe(0)
+    expect(errors).toEqual([])
+  })
+
+  // Reproduce: complete the job when the flush answers "busy"; the delivery then waits for a
+  // request no job serves.
+  test("waits for another flush's lease instead of failing or reporting", async () => {
+    const errors: SixbErrorContext[] = []
+    const { sixb, lakeStorage, queues } = createHost({ ingest: true, errors })
+    const retried: string[] = []
+    const retry = queues.lake.retry.bind(queues.lake)
+    queues.lake.retry = async (input) => {
+      retried.push(input.availableAt ?? "now")
+      await retry(input)
+    }
+
+    await ingestPerson(sixb, "1")
+    const held = await sixb.storage.datasetIngest!.acquire({
+      projectId: PROJECT_ID,
+      datasetId: people.id,
+      owner: "another-worker",
+      leaseMs: 60_000,
+    })
+    if (!held.acquired) throw new Error("expected the test to hold the lease")
+
+    await start(sixb)
+    await enqueueFlush(queues, 0)
+
+    await eventually(() => retried.length === 1)
+    expect(retried[0]).toBe(held.lease.expiresAt.toISOString())
+    expect(await lakeStorage.listVersions(people.id)).toEqual([])
+    expect(errors).toEqual([])
   })
 
   // Reproduce: return `{ kind: "fail" }` on the first error in lake-worker.ts.

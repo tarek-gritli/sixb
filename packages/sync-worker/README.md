@@ -58,10 +58,12 @@ row count, and committed `DatasetVersion`.
 
 ## Lake lane
 
-`SyncWorker` also hosts a `LakeWorker` on the `lake` queue lane whenever the host schedules lake
-retention (`lakeMaintenance` on, a lake provider with `maintenance`, and at least one dataset). It
+`SyncWorker` also hosts a `LakeWorker` on the `lake` queue lane whenever the host has lake work:
+retention is scheduled (`lakeMaintenance` on, a lake provider with `maintenance`, and at least one
+dataset), or a dataset can be ingested (storage with an ingest inbox, and a keyed dataset). It
 starts then even when the project has no syncs, and runs beside the sync lane, so a sync never
-delays lake work and lake work never takes a sync slot. It claims two jobs at a time.
+delays lake work and lake work never takes a sync slot. It claims four jobs at a time, and runs
+one retention pass at a time.
 
 A `lake.retention.requested` job runs one occurrence of the built-in schedule:
 
@@ -72,6 +74,16 @@ A `lake.retention.requested` job runs one occurrence of the built-in schedule:
   pass after min(½ `cleanupEvery`, 10 min); the next occurrence continues.
 - A failure retries through the queue a minute later. The third failure fails the job and is
   reported to `onError` as `lake.retention.failed`; shutdown releases the job instead.
+
+A `dataset.ingest.flush.requested` job flushes one dataset's ingested changes through
+`getDatasetIngestRuntime(host).flush` (see `packages/core/src/datasets/ingest-flush.ts`):
+
+- Its id names the flush request (`ingest-flush:<dataset>:<request>`), so the deliveries of one
+  request queue one job.
+- When another flush holds the dataset, the job retries when that lease would expire.
+- A failure retries after 1, 2, 5, 15 and 30 s, then every minute, and the job never fails: the
+  changes stay in the inbox, and the next attempt resumes the batch in flight. The flush reports
+  the fifth failure in a row as `dataset.ingest.flush.failed`.
 
 ## Development
 
