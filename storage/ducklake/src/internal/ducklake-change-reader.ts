@@ -36,6 +36,13 @@ const FEED_MAX_CHANGE_SHARE = 0.5
 /** Most snapshots naming the dataset that one change read plans its feed over. */
 const FEED_MAX_SNAPSHOTS = 512
 
+/**
+ * Most snapshots naming the dataset after the earlier version that a change read walks to find
+ * that none changed rows. Consumers read changes for every version they apply, so few usually
+ * stand between the two.
+ */
+const UNCHANGED_MAX_SNAPSHOTS = 32
+
 /** Columns DuckLake's change feed adds to the table's: a table column of the same name is ambiguous. */
 const FEED_COLUMNS: ReadonlySet<string> = new Set(["snapshot_id", "rowid", "change_type"])
 
@@ -53,7 +60,8 @@ interface FeedRead {
  * Two ways to compare, one result. Reading DuckLake's change feed costs what the versions in
  * between changed: it is used when every one of them recorded what it changed (`rowChanges`),
  * the identity is the dataset's validated primary key, and the feed is still complete (see
- * `planFeedRead`). Otherwise the two versions are joined in full.
+ * `planFeedRead`). Otherwise the two versions are joined in full. Neither is read when no version
+ * in between changed rows (`holdsRowsOf`).
  */
 export class DuckLakeChangeReader {
   constructor(
@@ -69,12 +77,6 @@ export class DuckLakeChangeReader {
     const columns = resolveDatasetChangeColumns(input, before, after)
     if (!columns || !before || !after) return null
 
-    // Versions that only record new provenance or source ordering hold their parent's rows: their
-    // change set is empty, whatever the keys, so it needs neither the key checks nor the join.
-    const unchanged =
-      (input.toVersionId === input.fromVersionId || !after.rowsChanged) &&
-      (await this.snapshots.holdsRowsOf(input.datasetId, input.toVersionId, input.fromVersionId))
-
     const lease = await this.connections.acquireAttachedRuntime()
     const runtime = lease.runtime
     const temporary = quoteIdentifier(`sixb_delta_${randomUUID().replaceAll("-", "")}`)
@@ -84,7 +86,7 @@ export class DuckLakeChangeReader {
       const ref = await resolveDatasetTableRef(this.options, runtime, input.datasetId)
       if (!ref) return null
 
-      if (unchanged) {
+      if (await this.holdsRowsOf(runtime, ref, input, after)) {
         const table = qualifiedTableName(this.options, ref.tableName)
         return noChanges(
           after.rowCount ??
@@ -155,6 +157,45 @@ export class DuckLakeChangeReader {
         await lease.release()
       }
     }
+  }
+
+  /**
+   * Whether the later version holds exactly the rows of the earlier one: every version in between
+   * changed none (`rowsChanged`), such as one of new provenance or source ordering. The change set
+   * is then empty, whatever the keys, and needs neither the key checks nor the join.
+   *
+   * It reads the range of versions `planFeedRead` reads, which skips maintenance commits and is
+   * incomplete when a snapshot in between was expired or altered the table outside Sixb.
+   */
+  private async holdsRowsOf(
+    runtime: DuckDbQueryRuntime,
+    table: DatasetTableRef,
+    input: ReadDatasetChangesInput,
+    after: DatasetVersion
+  ): Promise<boolean> {
+    const from = parseVersionId(input.fromVersionId)
+    const to = parseVersionId(input.toVersionId)
+    if (from === to) {
+      return true
+    }
+    if (after.rowsChanged || BigInt(from) > BigInt(to)) {
+      return false
+    }
+
+    const range = await this.snapshots.readChangeRange(
+      runtime,
+      table,
+      from,
+      to,
+      UNCHANGED_MAX_SNAPSHOTS + 1
+    )
+    const [first, ...later] = range?.complete ? range.versions : []
+
+    return (
+      first?.snapshotId === from &&
+      later.at(-1)?.snapshotId === to &&
+      later.every((version) => !version.rowsChanged)
+    )
   }
 
   /**

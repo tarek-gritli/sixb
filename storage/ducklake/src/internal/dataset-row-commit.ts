@@ -26,11 +26,10 @@ export interface ApplyDatasetRowsResult {
    */
   readonly targetWasEmpty: boolean
   /**
-   * The write inserted or deleted rows of the dataset table, which DuckLake checks against
-   * concurrent changes to the table. A merge that only advances source ordering changes none.
+   * Rows of the dataset table this write inserts and deletes, an updated row counting in both:
+   * what DuckLake checks against concurrent changes to the table. A merge that only advances
+   * source ordering changes none.
    */
-  readonly changedTableRows: boolean
-  /** Rows of the dataset table this write inserts and deletes: an updated row counts in both. */
   readonly insertedRows: number
   readonly deletedRows: number
 }
@@ -161,7 +160,6 @@ export async function applyDatasetRowsFromRelation(input: {
   return {
     dataChangeExpected: appendedRowCount > 0,
     targetWasEmpty,
-    changedTableRows: appendedRowCount > 0,
     sourceRowCount: appendedRowCount,
     resultingRowCount:
       input.previousRowCount === undefined
@@ -311,7 +309,6 @@ async function applyKeyedSnapshot(input: {
       sourceRowCount: input.sourceRowCount,
       resultingRowCount: { kind: "exact", value: input.sourceRowCount },
       targetWasEmpty: false,
-      changedTableRows: true,
       insertedRows: oneSided ? insertedRows + 1 : insertedRows,
       deletedRows: oneSided ? deletedRows + 1 : deletedRows,
     }
@@ -334,13 +331,11 @@ async function replaceRows(input: {
     `INSERT INTO ${input.table} (${input.columnsSql}) SELECT ${input.columnsSql} FROM ${input.sourceRelationSql}`
   )
 
-  const changedTableRows = input.sourceRowCount > 0 || input.targetRowCount > 0
   return {
-    dataChangeExpected: changedTableRows,
+    dataChangeExpected: input.sourceRowCount > 0 || input.targetRowCount > 0,
     sourceRowCount: input.sourceRowCount,
     resultingRowCount: { kind: "exact", value: input.sourceRowCount },
     targetWasEmpty: input.targetRowCount === 0,
-    changedTableRows,
     insertedRows: input.sourceRowCount,
     deletedRows: input.targetRowCount,
   }
@@ -352,7 +347,6 @@ function unchangedSnapshot(sourceRowCount: number, targetRowCount: number): Appl
     sourceRowCount,
     resultingRowCount: { kind: "exact", value: targetRowCount },
     targetWasEmpty: targetRowCount === 0,
-    changedTableRows: false,
     insertedRows: 0,
     deletedRows: 0,
   }

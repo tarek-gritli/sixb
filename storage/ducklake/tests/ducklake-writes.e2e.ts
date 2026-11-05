@@ -682,6 +682,31 @@ describe("DuckLakeStorage keyed snapshot writes", () => {
     expect(await sortedRows(accounts, seed.versionId)).toEqual(readRows(seedRows))
   }, 30_000)
 
+  // Regression proof: in applyKeyedSnapshot, drop the return for a write that changes no key. The
+  // version of identical rows then rewrites one, and records that it changed rows.
+  test("records a version of identical keyed rows from new inputs as changing none", async () => {
+    await storage.createDataset(accounts)
+    const seedRows = accountRows(100)
+    await snapshot(accounts, seedRows)
+
+    const write = await storage.beginWrite({
+      dataset: accounts,
+      mode: "snapshot",
+      inputs: [{ datasetId: "crm.sources", versionId: "ducklake:1" }],
+    })
+    await write.writeRows([...seedRows].reverse())
+    const provenanceOnly = await write.commit()
+
+    expect(provenanceOnly).toMatchObject({ outcome: "created", rowsChanged: false })
+    expect(await feedOf(accounts, provenanceOnly.versionId)).toEqual({})
+    expect(
+      await commitMetadataForVersion(storage, rootDir, provenanceOnly.versionId)
+    ).toMatchObject({ rowChanges: 0, rowsChanged: false })
+
+    const growth = await snapshot(accounts, [...seedRows, { id: "new1", name: "new", score: 1 }])
+    expect(growth).toMatchObject({ outcome: "created", rowsChanged: true })
+  }, 30_000)
+
   // Regression proof: in replacesEveryRow, drop either rule. The write changing 800 of 1,000 rows,
   // or the one changing 5,000 of 10,000, then deletes and inserts only those.
   test("replaces every row once 80% of them change, or 5% of a large table", async () => {

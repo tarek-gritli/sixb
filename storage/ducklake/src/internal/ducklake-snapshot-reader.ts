@@ -140,10 +140,6 @@ const FEED_PAGE_SIZE = 512
 // metadata of its version, whose lineage may be large.
 const SHORT_READ_BATCH_SIZE = 8
 
-// A change read between two versions of identical rows skips comparing them. Consumers read changes
-// for every version they apply, so few versions usually stand between the two.
-const UNCHANGED_ROWS_WALK_LIMIT = 32
-
 // The bulk catalog scan shares one descending walk of recent snapshots across
 // all requested datasets, so its cost is bounded by this window rather than by
 // the dataset count. A dataset whose latest version is older than the window
@@ -214,60 +210,6 @@ export class DuckLakeSnapshotReader {
       }
 
       return this.getVersionForTableRef(runtime, tableRef, snapshotId)
-    })
-  }
-
-  /**
-   * Whether a version holds exactly the rows of an earlier version of the dataset: every version
-   * committed after that one, up to this one, changed no rows.
-   *
-   * Reads the snapshots that name the dataset's tables between the two, from metadata only. More
-   * than `UNCHANGED_ROWS_WALK_LIMIT` of them, or one that is no Sixb version, such as a change
-   * made outside Sixb, reads as false: the caller compares the rows instead.
-   */
-  async holdsRowsOf(
-    datasetId: string,
-    versionId: string,
-    earlierVersionId: string
-  ): Promise<boolean> {
-    const snapshotId = parseVersionId(versionId)
-    const earlierSnapshotId = parseVersionId(earlierVersionId)
-    if (snapshotId === earlierSnapshotId) {
-      return true
-    }
-    if (BigInt(snapshotId) < BigInt(earlierSnapshotId)) {
-      return false
-    }
-
-    this.connections.assertOpen()
-
-    return this.connections.withAttachedRuntime(async (runtime) => {
-      const tableRef = await resolveDatasetTableRef(this.options, runtime, datasetId)
-      if (!tableRef) {
-        return false
-      }
-
-      // Newest first: this version, the snapshots between, then the earlier version itself.
-      const candidates = await this.querySnapshotCandidates(runtime, {
-        table: tableRef,
-        beforeSnapshotId: String(BigInt(snapshotId) + 1n),
-        fromSnapshotId: earlierSnapshotId,
-        limit: UNCHANGED_ROWS_WALK_LIMIT + 1,
-      })
-      if (
-        candidates[0]?.snapshotId !== snapshotId ||
-        candidates[candidates.length - 1]?.snapshotId !== earlierSnapshotId
-      ) {
-        return false
-      }
-
-      return candidates
-        .slice(0, -1)
-        .every(
-          (candidate) =>
-            this.candidateToSnapshotRow(datasetId, tableRef.tableId, candidate)?.rowsChanged ===
-            false
-        )
     })
   }
 

@@ -120,7 +120,7 @@ describe("DuckLakeStorage changes between versions of identical rows", () => {
     { id: "B", value: "two" },
   ]
 
-  // Red check: remove the `unchanged` branch of the change reader; the table is then read.
+  // Red check: remove the `holdsRowsOf` branch of the change reader; the table is then read.
   test("reads no change without reading the table", async () => {
     const first = await write(rows)
     const provenanceOnly = await write(rows)
@@ -150,6 +150,39 @@ describe("DuckLakeStorage changes between versions of identical rows", () => {
       changes: [{ before: { id: "B", value: "two" }, after: { id: "B", value: "new" } }],
     })
     expect(reads).not.toEqual([])
+  })
+
+  // Red check: in `readChangeRange`, keep maintenance commits among the versions; the compaction
+  // then reads as a change of rows, and the table is read.
+  test("reads no change across a compaction", async () => {
+    const first = await write(rows)
+    await compact(storage, dataset.id)
+    const provenanceOnly = await write(rows)
+
+    const { result, reads } = await recordTableReads(async () =>
+      collect(await read(first, provenanceOnly))
+    )
+    expect(result).toEqual({ fromRowCount: 2, toRowCount: 2, changes: [] })
+    expect(reads).toEqual([])
+  })
+
+  // Red check: in the change reader's `holdsRowsOf`, ignore whether the range is complete. The
+  // expired version's change then goes unread.
+  test("compares the rows when a version in between was expired", async () => {
+    const first = await write(rows)
+    const changed = await write([rows[0]!, { id: "B", value: "new" }])
+    const provenanceOnly = await write([rows[0]!, { id: "B", value: "new" }])
+    await internals(storage).connections.withExclusiveAttached(async (runtime) => {
+      await runtime.run(
+        `CALL ducklake_expire_snapshots('sixb_lake', versions => [${parseVersionId(changed)}])`
+      )
+    })
+
+    expect(await collect(await read(first, provenanceOnly))).toEqual({
+      fromRowCount: 2,
+      toRowCount: 2,
+      changes: [{ before: { id: "B", value: "two" }, after: { id: "B", value: "new" } }],
+    })
   })
 
   // Red check: drop the limit of the walk in `holdsRowsOf`; the long history is walked.
@@ -238,7 +271,7 @@ describe("DuckLakeStorage changes from the change feed", () => {
     const provenanceOnly = (await provenance.commit()).versionId
     versions.push(provenanceOnly)
 
-    await compact()
+    await compact(storage, accounts.id)
 
     // a1 changes again, and n1, added in between, goes.
     rows = edited(rows, { rename: ["a1", "a4"], remove: ["n1"], add: ["n5"] })
@@ -446,27 +479,27 @@ describe("DuckLakeStorage changes from the change feed", () => {
 
     return sortChanges(changes)
   }
-
-  async function compact() {
-    const table = quoteSqlString(encodeDatasetTableName(accounts.id))
-    for (const calls of [
-      [`CALL ducklake_flush_inlined_data('sixb_lake', table_name => ${table})`],
-      [
-        `CALL ducklake_rewrite_data_files('sixb_lake', ${table}, delete_threshold => 0)`,
-        `CALL ducklake_merge_adjacent_files('sixb_lake', ${table})`,
-      ],
-    ]) {
-      await internals(storage).connections.withExclusiveAttached(async (runtime) => {
-        await runtime.run("BEGIN TRANSACTION")
-        for (const call of calls) await runtime.run(call)
-        await runtime.run("COMMIT")
-      })
-    }
-  }
 })
 
 function internals(storage: DuckLakeStorage): ChangeReaderInternals {
   return storage as unknown as ChangeReaderInternals
+}
+
+async function compact(storage: DuckLakeStorage, datasetId: string) {
+  const table = quoteSqlString(encodeDatasetTableName(datasetId))
+  for (const calls of [
+    [`CALL ducklake_flush_inlined_data('sixb_lake', table_name => ${table})`],
+    [
+      `CALL ducklake_rewrite_data_files('sixb_lake', ${table}, delete_threshold => 0)`,
+      `CALL ducklake_merge_adjacent_files('sixb_lake', ${table})`,
+    ],
+  ]) {
+    await internals(storage).connections.withExclusiveAttached(async (runtime) => {
+      await runtime.run("BEGIN TRANSACTION")
+      for (const call of calls) await runtime.run(call)
+      await runtime.run("COMMIT")
+    })
+  }
 }
 
 function edited(

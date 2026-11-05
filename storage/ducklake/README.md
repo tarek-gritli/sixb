@@ -172,10 +172,6 @@ budget and PostgreSQL metadata pool. Metadata and writes remain available betwee
 Each read stays pinned to one immutable snapshot. Retention's file deletion waits until no reads
 remain; it blocks new reads only while deleting, so continuous traffic can postpone it.
 
-`readChanges` compares two versions in DuckDB. When no version between them changed rows
-(`rowsChanged` in the commit metadata, read from at most 32 snapshots), it returns an empty change
-set without reading the table.
-
 `maxStreamingReads` limits native streaming readers per provider (default: `4`); extra reads use
 bounded pages on the main connection. It does not limit pipeline inputs. Raise it when memory and
 catalog capacity allow. Finish the iterator, use `for await` with `break`, or pass `signal` to cancel
@@ -256,7 +252,9 @@ cost that follows what changed, when:
 - retention expired no snapshot in between.
 
 Otherwise it compares both versions in full. Compaction commits in between are skipped: they move
-rows without changing them.
+rows without changing them. When no version in between changed rows (`rowsChanged` in the commit
+metadata, read from at most 32 snapshots), it returns an empty change set without reading the
+table.
 
 ## Keyed Merges
 

@@ -380,15 +380,16 @@ export class DuckLakeWriteCoordinator {
       }
 
       const commitId = randomUUID()
+      const rowChanges = changeResult.insertedRows + changeResult.deletedRows
       await this.setCommitMetadata(input, {
         commitId,
         rowCount: commitRowCount(input, changeResult, latestVersion),
-        rowChanges: changeResult.insertedRows + changeResult.deletedRows,
+        rowChanges,
         uncomparedReplacements: changeResult.dataChangeExpected
           ? uncomparedReplacements
           : undefined,
         lineage,
-        rowsChanged: parent === null || changeResult.changedTableRows,
+        rowsChanged: parent === null || rowChanges > 0,
         lineageChanged: hasDatasetLineageChanges(parent, {
           datasetId: input.dataset.id,
           schema: input.dataset.schema,
@@ -879,7 +880,7 @@ function mustCommitOnReadSnapshot(
   input: DuckLakeCommitVersionOutcomeRuntimeInput,
   changeResult: ApplyDatasetRowsResult
 ): boolean {
-  if (!changeResult.changedTableRows) {
+  if (changeResult.insertedRows + changeResult.deletedRows === 0) {
     return true
   }
 
