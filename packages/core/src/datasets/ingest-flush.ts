@@ -29,6 +29,12 @@ import { lakeDatasetDefinition, writeDataset } from "./write"
 const LEASE_MS = 60_000
 const RENEW_EVERY_MS = 15_000
 
+/**
+ * A lease renewed less than `LEASE_MS - OWNED_MARGIN_MS` ago is still ours whatever the database
+ * says, so a flush checks it there only past that: the margin covers clock adjustments.
+ */
+const OWNED_MARGIN_MS = 10_000
+
 /** One job stops taking batches after this long; the next job continues. */
 const BUDGET_MS = 30_000
 
@@ -119,6 +125,8 @@ class DatasetIngestFlush {
   private readonly owner = `flush-owner_${randomUUID()}`
   private readonly lost = new AbortController()
   private readonly signal: AbortSignal
+  /** Until when the lease is surely ours: no other flush can have taken it before. */
+  private ownedUntil = 0
 
   constructor(
     private readonly dependencies: DatasetIngestRuntimeDependencies,
@@ -136,6 +144,7 @@ class DatasetIngestFlush {
   }
 
   async run(): Promise<DatasetIngestFlushOutcome> {
+    const askedAt = Date.now()
     const acquired = await this.inbox.acquire({
       projectId: this.dependencies.projectId,
       datasetId: this.datasetId,
@@ -145,6 +154,7 @@ class DatasetIngestFlush {
     if (!acquired.acquired) return { kind: "busy", until: acquired.busyUntil }
 
     const { lease } = acquired
+    this.owned(askedAt)
     const renewal = setInterval(() => this.renew(lease), RENEW_EVERY_MS)
 
     try {
@@ -503,23 +513,39 @@ class DatasetIngestFlush {
 
   /**
    * Stops a flush that lost its lease, right before it writes: a flush paused past its lease may
-   * find another one resumed its batch and wrote it. What remains is a pause longer than the lease
-   * between this check and the lake's commit; the commit then races the other flush's, which the
-   * lake's optimistic merge settles.
+   * find another one resumed its batch and wrote it. A lease renewed recently enough is still ours
+   * and costs no round trip. What remains is a pause longer than the lease between this check and
+   * the lake's commit; the commit then races the other flush's, which the lake's optimistic merge
+   * settles.
    */
   private async assertOwned(lease: DatasetIngestLease): Promise<void> {
+    if (Date.now() < this.ownedUntil) return
+
+    const askedAt = Date.now()
     const renewed = await this.inbox.renew({ lease, leaseMs: LEASE_MS })
-    if (renewed) return
+    if (renewed) {
+      this.owned(askedAt)
+      return
+    }
 
     throw new DatasetIngestLeaseLostError(
       `[Sixb] Dataset '${this.datasetId}' ingest lease was taken over by another flush.`
     )
   }
 
+  /** The lease was ours when asked at `askedAt`, for one lease from then. */
+  private owned(askedAt: number): void {
+    this.ownedUntil = askedAt + LEASE_MS - OWNED_MARGIN_MS
+  }
+
   private renew(lease: DatasetIngestLease): void {
+    const askedAt = Date.now()
     this.inbox.renew({ lease, leaseMs: LEASE_MS }).then(
       (renewed) => {
-        if (renewed) return
+        if (renewed) {
+          this.owned(askedAt)
+          return
+        }
         this.lost.abort(
           new DatasetIngestLeaseLostError(
             `[Sixb] Dataset '${this.datasetId}' ingest lease was taken over by another flush.`

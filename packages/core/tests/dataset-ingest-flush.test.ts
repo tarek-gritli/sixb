@@ -585,6 +585,23 @@ test("a flush paused before it writes stops when another resumed its batch meanw
   expect(await lakeStorage.listVersions(contacts.id)).toHaveLength(1)
 })
 
+test("a flush that writes right after taking its batch does not ask whether it still holds it", async () => {
+  // Regression proof: renew in \`assertOwned\` whatever \`ownedUntil\` says; every batch then
+  // costs one more database round trip before its write.
+  const { storage, ingest, flush } = setup()
+  await ingest(contacts, change.upsert({ id: "1", name: "Ada" }))
+
+  let renewals = 0
+  const renew = storage.datasetIngest.renew.bind(storage.datasetIngest)
+  storage.datasetIngest.renew = async (input) => {
+    renewals += 1
+    return renew(input)
+  }
+
+  expect(await flush(contacts)).toEqual({ kind: "flushed", versions: 1, deliveries: 1 })
+  expect(renewals).toBe(0)
+})
+
 test("a flush that runs past its lease renews it, and stops when it loses it", async () => {
   // Regression proof: drop the \`setInterval\` renewal from \`run\`; the second flush takes the
   // dataset after 60 s. Drop the \`lost\` abort from \`renew\`; the flush that lost it writes.
