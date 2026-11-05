@@ -537,7 +537,9 @@ export class DuckLakeWriteCoordinator {
     // from DuckLake itself. commitId is only a transaction correlation token so
     // concurrent writers do not accidentally hydrate each other's snapshots.
     // Every keyed data path either replaces the baseline or validates its uniqueness before this
-    // marker is persisted. Merge commits can therefore avoid repeating that full-table audit.
+    // marker is persisted: a snapshot that writes only its difference checks that the table holds
+    // exactly the rows the difference accounts for, and replaces them otherwise. Merge commits can
+    // therefore avoid repeating that full-table audit.
     const validatedPrimaryKeyColumns = getDatasetPrimaryKeyColumns(input.dataset)
     const metadata: SixbCommitMetadata = {
       kind: "datasetVersion",

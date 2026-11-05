@@ -4,16 +4,17 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { col, type DatasetDefinition, type DatasetRow, defineDataset } from "@sixb/core"
 import type { DuckLakeStorage } from "../src"
-import type { DuckDbRuntime } from "../src/internal/duckdb-runtime"
+import type { DuckDbExclusiveRuntime, DuckDbRuntime } from "../src/internal/duckdb-runtime"
 import type { DuckLakeSnapshotReader } from "../src/internal/ducklake-snapshot-reader"
 import { encodeDatasetTableName } from "../src/internal/names"
-import { duckLakeMetadataTableName, quoteSqlString } from "../src/internal/sql"
+import { duckLakeMetadataTableName, quoteIdentifier, quoteSqlString } from "../src/internal/sql"
 import { parseCommitMetadata, parseVersionId } from "../src/internal/versions"
 import { collectRows, createLocalDuckLakeStorage, localDuckLakeOptions } from "./test-utils"
 
 interface DuckLakeStorageInternals {
   readonly connections: {
     attachedRuntime(): Promise<DuckDbRuntime>
+    withExclusiveAttached<T>(run: (runtime: DuckDbExclusiveRuntime) => Promise<T>): Promise<T>
   }
   readonly snapshotReader: {
     getLatestVersionForTableRef: DuckLakeSnapshotReader["getLatestVersionForTableRef"]
@@ -752,6 +753,39 @@ describe("DuckLakeStorage keyed snapshot writes", () => {
     smallLatest = (await guardedSnapshot(small, smallRows, smallLatest)).versionId
     expect(await feedOf(small, smallLatest)).toEqual(changed)
   }, 60_000)
+
+  // Regression proof: in applyKeyedSnapshot, drop the check of the table's row count. The
+  // snapshots then keep the second a1 another client inserted: 101 rows for a recorded 100.
+  test("replaces a table holding a key twice, which another client inserted", async () => {
+    await storage.createDataset(accounts)
+    const rows = accountRows(100)
+    let latest = (await guardedSnapshot(accounts, rows, null)).versionId
+
+    const insertDuplicate = async () => {
+      await (storage as unknown as DuckLakeStorageInternals).connections.withExclusiveAttached(
+        async (runtime) => {
+          await runtime.run(
+            `INSERT INTO sixb_lake.main.${quoteIdentifier(encodeDatasetTableName(accounts.id))}
+             VALUES ('a1', 'account 1', 1)`
+          )
+        }
+      )
+      return (await storage.getLatestVersion(accounts.id))!.versionId
+    }
+
+    // The same rows again, then one row changed: each replaces the table, without the duplicate.
+    for (const next of [
+      rows,
+      rows.map((row) => (row.id === "a5" ? { ...row, name: "renamed" } : row)),
+    ]) {
+      latest = await insertDuplicate()
+      const version = await guardedSnapshot(accounts, next, latest)
+      expect(version).toMatchObject({ outcome: "created", rowCount: 100 })
+      expect(await feedOf(accounts, version.versionId)).toEqual({ delete: 101, insert: 100 })
+      expect(await sortedRows(accounts, version.versionId)).toEqual(readRows(next))
+      latest = version.versionId
+    }
+  }, 30_000)
 
   // Regression proof: in applyKeyedSnapshot, drop the delete or the insert statement. The
   // shrinking or the growing write then keeps rows it removed, or loses rows it added.

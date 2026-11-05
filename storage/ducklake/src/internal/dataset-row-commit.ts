@@ -128,6 +128,7 @@ export async function applyDatasetRowsFromRelation(input: {
         table,
         sourceRelationSql: input.sourceRelationSql,
         sourceRowCount,
+        previousRowCount: input.previousRowCount,
         primaryKeyColumns,
       })
     }
@@ -187,6 +188,8 @@ async function applyKeyedSnapshot(input: {
   readonly table: string
   readonly sourceRelationSql: string
   readonly sourceRowCount: number
+  /** The row count the latest version recorded, when the commit read it. */
+  readonly previousRowCount?: number
   readonly primaryKeyColumns: readonly string[]
 }): Promise<ApplyDatasetRowsResult> {
   const columnsSql = datasetSchemaColumnNamesSql(input.dataset.schema)
@@ -229,8 +232,22 @@ async function applyKeyedSnapshot(input: {
     const insertedRows = counts === undefined ? 0 : Number(getBigIntLike(counts, "inserted"))
     const deletedRows = counts === undefined ? 0 : Number(getBigIntLike(counts, "deleted"))
 
-    // The source holds every row the table keeps, so the table held those plus the deleted ones.
+    // The source holds every row the table keeps, so the table held those plus the deleted ones,
+    // provided its keys are unique. A table holding more, such as a key a client outside Sixb
+    // inserted twice, is replaced: a difference would keep the duplicate.
     const targetRowCount = input.sourceRowCount - insertedRows + deletedRows
+    const actualRowCount = input.previousRowCount ?? (await countRows(input.runtime, input.table))
+    if (actualRowCount !== targetRowCount) {
+      return replaceRows({
+        runtime: input.runtime,
+        table: input.table,
+        columnsSql,
+        sourceRelationSql: input.sourceRelationSql,
+        sourceRowCount: input.sourceRowCount,
+        targetRowCount: actualRowCount,
+      })
+    }
+
     if (changedKeys === 0) {
       return unchangedSnapshot(input.sourceRowCount, targetRowCount)
     }
