@@ -24,7 +24,7 @@ within a second, so many webhooks give a few versions instead of one each.
 | Input | Iterable or async iterable of complete-row upserts and primary-key deletes |
 | Cancellation | Optional `signal: AbortSignal`, until the changes are stored |
 | Validation | Registered schema, primary key, source sequence, and referenced blobs; errors throw from `ingest` |
-| Result | `{ deliveryId, changes }`: the stored changes' id (`null` for no changes) and their count |
+| Result | `{ deliveryId, changes }`: the id that names this call's changes in failure reports (`null` when there were none), and their count |
 | Order | Changes apply in the order `ingest` calls stored them, as one call after another would |
 | Downstream work | Each new version emits `dataset.version.committed`; pipelines and projections run asynchronously |
 | Authority | Trusted backend executions, or explicitly disabled authorization; dataset-view grants do not permit ingestion |
@@ -77,6 +77,6 @@ Ingestion updates source data. Existing pipelines and projections determine the 
 
 | Failure | What happens |
 | --- | --- |
-| The lake is unavailable | Retried until it succeeds; `dataset.ingest.flush.failed` reaches `onError` at the fifth failure in a row |
-| Changes wait 10 minutes with no worker | `dataset.ingest.flush.failed` reaches `onError` |
-| The lake refuses a change once stored, such as a source sequence another call holds with other content | That call's changes are dropped and `dataset.ingest.rejected` names its key and sequence; the others are written |
+| The lake or blob storage is unavailable | Retried until it succeeds; `dataset.ingest.flush.failed` reaches `onError` at the fifth failure in a row |
+| Changes wait 10 minutes and nothing writes them | `dataset.ingest.flush.failed` reaches `onError` |
+| A stored change is refused when written: no longer valid for the schema, a deleted blob, a value the lake cannot hold, or a source sequence another call holds with other content | That call's changes are dropped and `dataset.ingest.rejected` names it and the refused change; the other calls' changes are written |
