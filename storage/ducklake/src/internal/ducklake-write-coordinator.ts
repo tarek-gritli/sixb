@@ -37,6 +37,7 @@ import type { DuckLakeDatasetCatalog } from "./ducklake-dataset-catalog"
 import { createDuckLakeMergeSession, type DuckLakeCommitMergeInput } from "./ducklake-merge-session"
 import type { DuckLakeSnapshotReader, DuckLakeVersionSummary } from "./ducklake-snapshot-reader"
 import {
+  beginDatasetTransaction,
   beginTransactionOnLatestVersion,
   CatalogMovedError,
   commitVersionTransaction,
@@ -641,7 +642,7 @@ export class DuckLakeWriteCoordinator {
       input.expectedLatestVersionId === undefined &&
       !isSqliteCatalog(this.options.catalog)
     ) {
-      await input.runtime.run("BEGIN TRANSACTION")
+      await beginDatasetTransaction(this.options, input.runtime, input.dataset.id)
       return undefined
     }
 
