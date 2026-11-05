@@ -84,7 +84,7 @@ export interface DatasetIngestRuntimeDependencies {
   readonly inbox: DatasetIngestStorage | undefined
   readonly lakeStorage: LakeStorage
   readonly blobStorage: Pick<BlobStorage, "stat">
-  readonly events: Pick<DomainEventLog, "emit">
+  readonly events: Pick<DomainEventLog, "append" | "emit">
   readonly datasets: {
     list(): readonly DatasetDefinition[]
     getById(datasetId: string): DatasetDefinition | null
@@ -191,12 +191,15 @@ class DatasetIngestFlush {
       }
 
       const committed = await this.commit(dataset, lease, batch, resumed)
-      await this.inbox.complete({ lease, flushId: batch.flushId })
 
+      // Announced before the batch is deleted: a flush that dies in between leaves the batch in
+      // flight, and the one that resumes it finds the version and announces it again.
       if (committed.version) {
         versions += 1
         await this.announce(dataset, committed)
       }
+
+      await this.inbox.complete({ lease, flushId: batch.flushId })
 
       deliveries += committed.deliveries.length
       batch = null
@@ -455,29 +458,27 @@ class DatasetIngestFlush {
     })
   }
 
+  /** Appends `dataset.version.committed`. A failure fails the attempt, which announces again. */
   private async announce(dataset: DatasetDefinition, committed: CommittedBatch): Promise<void> {
     const { version, producer, deliveries } = committed
     if (!version) return
 
-    await this.dependencies.events.emit(
-      {
-        events: [
-          {
-            type: "dataset.version.committed",
-            payload: {
-              datasetId: dataset.id,
-              versionId: version.versionId,
-              createdAt: version.createdAt.toISOString(),
-              producer,
-              rowsChanged: version.rowsChanged,
-              lineageChanged: version.lineageChanged,
-            },
+    await this.dependencies.events.append({
+      events: [
+        {
+          type: "dataset.version.committed",
+          payload: {
+            datasetId: dataset.id,
+            versionId: version.versionId,
+            createdAt: version.createdAt.toISOString(),
+            producer,
+            rowsChanged: version.rowsChanged,
+            lineageChanged: version.lineageChanged,
           },
-        ],
-        ...(deliveries[0] ? { correlationId: deliveries[0].correlationId } : {}),
-      },
-      { source: "SixbDatasets" }
-    )
+        },
+      ],
+      ...(deliveries[0] ? { correlationId: deliveries[0].correlationId } : {}),
+    })
   }
 
   /** The budget is spent with deliveries left: ask for the next job as `ingest` does. */

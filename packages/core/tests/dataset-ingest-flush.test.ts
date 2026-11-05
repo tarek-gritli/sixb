@@ -76,13 +76,14 @@ class RefusingLakeStorage extends InMemoryLakeStorage {
 function setup(lakeStorage = new InMemoryLakeStorage()) {
   const storage = new InMemoryStorage()
   const blobStorage = new InMemoryBlobStorage()
+  const broker = new InMemoryBroker()
   const reports: SixbErrorContext[] = []
   const host = new SixbHost({
     id: "ingest-flush-test",
     ontology: [],
     datasets: [people, contacts, documents],
     lakeStorage,
-    broker: new InMemoryBroker(),
+    broker,
     storage,
     queues: new InMemoryQueues(),
     blobStorage,
@@ -115,6 +116,7 @@ function setup(lakeStorage = new InMemoryLakeStorage()) {
     storage,
     lakeStorage,
     blobStorage,
+    broker,
     sixb,
     scope,
     flush,
@@ -440,7 +442,30 @@ test("a flush that dies after its commit is resumed without writing its batch ag
   expect(await lakeStorage.listVersions(contacts.id)).toHaveLength(2)
   expect((await rows(contacts)).map((row) => row.name)).toEqual(["From the sync"])
 
-  // The resumed flush announces the version the dead one could not.
+  // The dead flush announced its version before it died, and the resumed one again: at least once.
+  const announced = await committed()
+  expect(announced.map((event) => event.payload.datasetId)).toEqual([contacts.id, contacts.id])
+  expect(new Set(announced.map((event) => event.payload.versionId)).size).toBe(1)
+})
+
+test("a version whose announcement fails is announced when its batch is resumed", async () => {
+  // Regression proof: complete the batch before announcing it in \`flushBatches\`; the batch is
+  // gone when the announcement fails, and no flush ever announces the version.
+  const { broker, ingest, flush, committed, lakeStorage } = setup()
+  await ingest(contacts, change.upsert({ id: "1", name: "Ada" }))
+
+  const append = broker.append.bind(broker)
+  broker.append = async () => {
+    throw new Error("broker offline")
+  }
+  const failed = await flush(contacts).catch((error) => error)
+  broker.append = append
+
+  expect(failed).toBeInstanceOf(DatasetIngestFlushError)
+  expect(await committed()).toEqual([])
+
+  expect(await flush(contacts)).toEqual({ kind: "flushed", versions: 1, deliveries: 1 })
+  expect(await lakeStorage.listVersions(contacts.id)).toHaveLength(1)
   expect(await committed()).toHaveLength(1)
 })
 
