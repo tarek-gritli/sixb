@@ -4,7 +4,13 @@ import { InMemoryBroker } from "../broker"
 import { change, col, type DatasetDefinition, defineDataset, type MergeChange } from "../datasets"
 import { getDatasetIngestRuntime } from "../datasets/ingest-flush"
 import { writeDataset } from "../datasets/write"
-import type { DatasetMergeCommitResult, DatasetRow, LakeStorage } from "../lake-storage"
+import {
+  type DatasetMergeCommitResult,
+  type DatasetRow,
+  DatasetSequenceConflictError,
+  datasetSequenceChange,
+  type LakeStorage,
+} from "../lake-storage"
 import { InMemoryQueues } from "../queues"
 import { SixbHost } from "../runtime/host"
 import { InMemoryStorage } from "../storage"
@@ -43,6 +49,26 @@ async function rows(storage: LakeStorage, definition: DatasetDefinition = datase
   const result: DatasetRow[] = []
   for await (const row of storage.readRows({ datasetId: definition.id })) result.push(row)
   return result
+}
+
+/**
+ * A tie refuses the merge with a DatasetSequenceConflictError naming the change it refused, so a
+ * caller holding many changes refuses exactly that one.
+ *
+ * Reproduce: throw a plain LakeStorageError, or leave out the content, in
+ * `reconcileDatasetSequences`; every tie assertion below fails.
+ */
+async function expectConflict(
+  storage: LakeStorage,
+  changes: readonly MergeChange<DatasetRow, DatasetRow>[],
+  refused: MergeChange<DatasetRow, DatasetRow>
+) {
+  const error = await merge(storage, changes).catch((caught) => caught)
+  const { key, sequence, content } = datasetSequenceChange(dataset, refused)
+
+  expect(error).toBeInstanceOf(DatasetSequenceConflictError)
+  expect(error).toMatchObject({ datasetId: dataset.id, key, sequence, content })
+  expect(String(error)).toContain("conflicting content")
 }
 
 export function runDatasetSequenceContract<TStorage extends LakeStorage>(
@@ -260,9 +286,11 @@ export function runDatasetSequenceContract<TStorage extends LakeStorage>(
           "unchanged"
         )
         expect((await merge(storage, [upsert("09007199254740993")])).outcome).toBe("unchanged")
-        await expect(
-          merge(storage, [upsert("1", "other", "other"), upsert("9007199254740993", "conflict")])
-        ).rejects.toThrow("conflicting content")
+        await expectConflict(
+          storage,
+          [upsert("1", "other", "other"), upsert("9007199254740993", "conflict")],
+          upsert("9007199254740993", "conflict")
+        )
         expect((await storage.getLatestVersion(dataset.id))?.versionId).toBe(
           first.version?.versionId
         )
@@ -272,9 +300,11 @@ export function runDatasetSequenceContract<TStorage extends LakeStorage>(
           upsert("9007199254740994", "stale"),
         ])
         expect((await rows(storage))[0]?.name).toBe("newest")
-        await expect(
-          merge(storage, [upsert("9007199254740996", "a"), upsert("9007199254740996", "b")])
-        ).rejects.toThrow("conflicting content")
+        await expectConflict(
+          storage,
+          [upsert("9007199254740996", "a"), upsert("9007199254740996", "b")],
+          upsert("9007199254740996", "b")
+        )
         expect((await rows(storage))[0]?.name).toBe("newest")
       }))
 
@@ -290,8 +320,12 @@ export function runDatasetSequenceContract<TStorage extends LakeStorage>(
         expect(
           (await merge(storage, [change.delete({ id: "42" }, { sequence: "9" })])).outcome
         ).toBe("unchanged")
-        await expect(merge(storage, [upsert(9)])).rejects.toThrow("conflicting content")
+        await expectConflict(storage, [upsert(9)], upsert(9))
         await merge(storage, [upsert(10)])
+        expect(await rows(storage)).toHaveLength(1)
+        // A delete at an upsert's sequence is refused with no content.
+        const tombstone = change.delete({ id: "42" }, { sequence: 10 })
+        await expectConflict(storage, [tombstone], tombstone)
         expect(await rows(storage)).toHaveLength(1)
         expect((await merge(storage, [change.delete({ id: "42" }, { sequence: 9 })])).outcome).toBe(
           "unchanged"

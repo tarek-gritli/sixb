@@ -60,7 +60,8 @@ export type DatasetMergeCommitResult =
 export interface LakeMergeSession {
   /**
    * Stage ordered complete-row upserts and exact primary-key deletes. With sequenceBy, deletes
-   * require a sequence, stale changes are ignored, and conflicting ties abort the whole merge.
+   * require a sequence, stale changes are ignored, and conflicting ties abort the whole merge with
+   * a `DatasetSequenceConflictError` naming the refused change.
    */
   writeChanges(
     changes:
