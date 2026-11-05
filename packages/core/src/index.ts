@@ -234,6 +234,7 @@ export type {
   DatasetEventSelectorContext,
   DatasetEventSelectorEvent,
   DatasetEventToken,
+  DatasetIngestQueuedEvent,
   DatasetVersionCommittedEvent,
   DomainEvent,
   DomainEventLog,
@@ -1010,6 +1011,8 @@ export type {
 } from "./datasets/lineage"
 export type {
   SixbActionPhaseFailedContext,
+  SixbDatasetIngestFlushFailedContext,
+  SixbDatasetIngestRejectedContext,
   SixbErrorContext,
   SixbErrorHandler,
   SixbEventDeliveryFailedContext,

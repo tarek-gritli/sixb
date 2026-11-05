@@ -1,0 +1,501 @@
+import { randomUUID } from "node:crypto"
+import type { BlobStorage } from "../blob-storage"
+import {
+  reportDatasetIngestFlushFailure,
+  reportDatasetIngestRejection,
+} from "../error-reporting/capability"
+import { captureSixbFailure } from "../errors/internal"
+import type { DomainEventLog } from "../events/service"
+import { LakeConcurrencyError } from "../lake-storage/errors"
+import { getDatasetPrimaryKeyColumns } from "../lake-storage/merge-validation"
+import {
+  DatasetSequenceConflictError,
+  datasetSequenceChange,
+} from "../lake-storage/source-ordering"
+import type { DatasetProducer, DatasetVersion, LakeStorage } from "../lake-storage/types"
+import {
+  type DatasetIngestBatch,
+  type DatasetIngestChange,
+  type DatasetIngestDelivery,
+  type DatasetIngestLease,
+  DatasetIngestLeaseLostError,
+  type DatasetIngestStorage,
+} from "../storage/dataset-ingest"
+import type { DatasetDefinition } from "./types"
+import { writeDataset } from "./write"
+
+/** How long a flush holds a dataset without renewing. A holder that dies frees it after this. */
+const LEASE_MS = 60_000
+const RENEW_EVERY_MS = 15_000
+
+/** One job stops taking batches after this long; the next job continues. */
+const BUDGET_MS = 30_000
+
+/** Most changes one version holds, unless one delivery alone holds more. */
+export const DATASET_INGEST_MAX_CHANGES = 10_000
+
+/** Failures in a row after which the dataset is reported. Flushes go on trying. */
+const REPORT_AT_FAILURE_STREAK = 5
+
+/** A version is looked for among this many of the dataset's newest. */
+const LOOKUP_VERSIONS = 200
+/** Clocks of the process that committed and of the database that dated the batch may differ. */
+const LOOKUP_CLOCK_SKEW_MS = 60_000
+
+const CONCURRENCY_ATTEMPTS = 3
+
+export type DatasetIngestFlushOutcome =
+  | {
+      readonly kind: "flushed"
+      readonly versions: number
+      readonly deliveries: number
+    }
+  /** Another flush holds the dataset until then. */
+  | { readonly kind: "busy"; readonly until: Date }
+
+/** A flush attempt failed; its batch stays in the inbox for the next one. */
+export class DatasetIngestFlushError extends Error {
+  override readonly name = "DatasetIngestFlushError"
+
+  constructor(
+    message: string,
+    readonly failureStreak: number,
+    options: { readonly cause: unknown }
+  ) {
+    super(message, options)
+  }
+}
+
+/** Internal entry point for the worker that flushes, and for tests. */
+export interface DatasetIngestRuntime {
+  /** Whether the host keeps an inbox and registers a dataset `ingest` can write. */
+  readonly enabled: boolean
+  /**
+   * Writes the dataset's ingested changes to the lake, one version per batch, until its inbox is
+   * empty or the job's budget is spent; then the next job continues. Resumes a batch a flush that
+   * died left in flight, and never writes one twice.
+   */
+  flush(datasetId: string, signal: AbortSignal): Promise<DatasetIngestFlushOutcome>
+}
+
+export interface DatasetIngestRuntimeDependencies {
+  readonly projectId: string
+  readonly inbox: DatasetIngestStorage | undefined
+  readonly lakeStorage: LakeStorage
+  readonly blobStorage: Pick<BlobStorage, "stat">
+  readonly events: Pick<DomainEventLog, "emit">
+  readonly datasets: {
+    list(): readonly DatasetDefinition[]
+    getById(datasetId: string): DatasetDefinition | null
+  }
+  /** Where failures are reported: the host. */
+  readonly reporter: object
+}
+
+export function createDatasetIngestRuntime(
+  dependencies: DatasetIngestRuntimeDependencies
+): DatasetIngestRuntime {
+  const enabled =
+    dependencies.inbox !== undefined &&
+    dependencies.datasets.list().some((dataset) => getDatasetPrimaryKeyColumns(dataset) !== null)
+
+  return {
+    enabled,
+    flush: async (datasetId, signal) =>
+      new DatasetIngestFlush(dependencies, datasetId, signal).run(),
+  }
+}
+
+interface CommittedBatch {
+  readonly version: DatasetVersion | null
+  readonly producer: DatasetProducer
+  readonly deliveries: readonly DatasetIngestDelivery[]
+}
+
+/** One job's flush of one dataset. */
+class DatasetIngestFlush {
+  private readonly inbox: DatasetIngestStorage
+  private readonly owner = `flush-owner_${randomUUID()}`
+  private readonly lost = new AbortController()
+  private readonly signal: AbortSignal
+
+  constructor(
+    private readonly dependencies: DatasetIngestRuntimeDependencies,
+    private readonly datasetId: string,
+    signal: AbortSignal
+  ) {
+    if (!dependencies.inbox) {
+      throw new Error(
+        "[Sixb] Flushing ingested changes requires storage with a dataset ingest inbox."
+      )
+    }
+
+    this.inbox = dependencies.inbox
+    this.signal = AbortSignal.any([signal, this.lost.signal])
+  }
+
+  async run(): Promise<DatasetIngestFlushOutcome> {
+    const acquired = await this.inbox.acquire({
+      projectId: this.dependencies.projectId,
+      datasetId: this.datasetId,
+      owner: this.owner,
+      leaseMs: LEASE_MS,
+    })
+    if (!acquired.acquired) return { kind: "busy", until: acquired.busyUntil }
+
+    const { lease } = acquired
+    const renewal = setInterval(() => this.renew(lease), RENEW_EVERY_MS)
+
+    try {
+      return await this.flushBatches(lease)
+    } catch (error) {
+      throw await this.failed(lease, error)
+    } finally {
+      clearInterval(renewal)
+    }
+  }
+
+  private async flushBatches(lease: DatasetIngestLease): Promise<DatasetIngestFlushOutcome> {
+    const dataset = this.dependencies.datasets.getById(this.datasetId)
+    if (!dataset) {
+      throw new Error(
+        `[Sixb] Dataset '${this.datasetId}' is not registered; its ingested changes wait in the inbox until it is.`
+      )
+    }
+
+    const startedAt = Date.now()
+    let batch = lease.inFlight
+    let resumed = batch !== null
+    let versions = 0
+    let deliveries = 0
+
+    for (;;) {
+      this.signal.throwIfAborted()
+
+      if (batch === null) {
+        if (Date.now() - startedAt >= BUDGET_MS) {
+          await this.inbox.release({ lease })
+          await this.requestAgain()
+          return { kind: "flushed", versions, deliveries }
+        }
+
+        batch = await this.inbox.takeBatch({
+          lease,
+          flushId: `flush_${randomUUID()}`,
+          maxChanges: DATASET_INGEST_MAX_CHANGES,
+        })
+        // Nothing pending: the batch released the lease.
+        if (batch === null) return { kind: "flushed", versions, deliveries }
+        resumed = false
+      }
+
+      const committed = await this.commit(dataset, lease, batch, resumed)
+      await this.inbox.complete({ lease, flushId: batch.flushId })
+
+      if (committed.version) {
+        versions += 1
+        await this.announce(dataset, committed)
+      }
+
+      deliveries += committed.deliveries.length
+      batch = null
+    }
+  }
+
+  /**
+   * Writes the batch as one merge version, unless the lake already holds it: a resumed batch, or
+   * one whose commit lost a race, may have been committed by a flush that did not live to delete
+   * it. Deliveries the lake refuses are dropped and reported, and the rest committed.
+   */
+  private async commit(
+    dataset: DatasetDefinition,
+    lease: DatasetIngestLease,
+    batch: DatasetIngestBatch,
+    resumed: boolean
+  ): Promise<CommittedBatch> {
+    let deliveries = batch.deliveries
+    const producerOf = (oldest: DatasetIngestDelivery): DatasetProducer => ({
+      kind: "ingest",
+      id: oldest.executionId,
+      runId: batch.flushId,
+    })
+
+    if (resumed) {
+      const version = await this.findCommitted(batch)
+      if (version) return { version, producer: version.producer ?? { kind: "ingest" }, deliveries }
+    }
+
+    for (let attempt = 1; ; attempt += 1) {
+      const oldest = deliveries[0]
+      if (!oldest) return { version: null, producer: { kind: "ingest" }, deliveries }
+
+      const producer = producerOf(oldest)
+
+      try {
+        const result = await writeDataset({
+          lakeStorage: this.dependencies.lakeStorage,
+          blobStorage: this.dependencies.blobStorage,
+          dataset,
+          mode: "merge",
+          signal: this.signal,
+          producer,
+          sourceLabel: `[Sixb] Dataset '${dataset.id}' ingested change`,
+          readValues: async () => this.values(lease, batch.flushId),
+          mapValidationError: (error, value) => new RefusedChange(value, error),
+        })
+
+        return {
+          version: result.outcome === "created" ? result.version : null,
+          producer,
+          deliveries,
+        }
+      } catch (error) {
+        const refused =
+          error instanceof RefusedChange
+            ? error
+            : error instanceof DatasetSequenceConflictError
+              ? await this.findConflicting(dataset, lease, batch, error)
+              : null
+
+        if (refused) {
+          await this.reject(dataset, lease, batch, refused)
+          deliveries = deliveries.filter((delivery) => delivery.id !== refused.value.delivery.id)
+          continue
+        }
+
+        if (error instanceof LakeConcurrencyError && attempt < CONCURRENCY_ATTEMPTS) {
+          const version = await this.findCommitted(batch)
+          if (version) return { version, producer, deliveries }
+          continue
+        }
+
+        throw error
+      }
+    }
+  }
+
+  /** The batch's changes, in inbox order, each with where it came from. */
+  private async *values(lease: DatasetIngestLease, flushId: string): AsyncIterable<BatchValue> {
+    for await (const { delivery, changes } of this.inbox.readChanges({ lease, flushId })) {
+      for (const [changeIndex, change] of changes.entries()) {
+        yield { value: change, delivery, changeIndex }
+      }
+    }
+  }
+
+  /** A version of this batch among the dataset's newest, dated from when it took its deliveries. */
+  private async findCommitted(batch: DatasetIngestBatch): Promise<DatasetVersion | null> {
+    const versions = await this.dependencies.lakeStorage.listVersions(
+      this.datasetId,
+      LOOKUP_VERSIONS
+    )
+    const oldestPossible = batch.startedAt.getTime() - LOOKUP_CLOCK_SKEW_MS
+
+    for (const version of versions) {
+      if (version.producer?.kind === "ingest" && version.producer.runId === batch.flushId) {
+        return version
+      }
+      if (version.createdAt.getTime() < oldestPossible) return null
+    }
+
+    if (versions.length < LOOKUP_VERSIONS) return null
+
+    throw new Error(
+      `[Sixb] Dataset '${this.datasetId}' committed more than ${LOOKUP_VERSIONS} versions since flush '${batch.flushId}' started; cannot tell whether it committed.`
+    )
+  }
+
+  /** The last change of the batch at the conflicting key and sequence: the one to refuse. */
+  private async findConflicting(
+    dataset: DatasetDefinition,
+    lease: DatasetIngestLease,
+    batch: DatasetIngestBatch,
+    conflict: DatasetSequenceConflictError
+  ): Promise<RefusedChange | null> {
+    let last: BatchValue | null = null
+
+    for await (const value of this.values(lease, batch.flushId)) {
+      const { key, sequence } = datasetSequenceChange(dataset, value.value)
+      if (key === conflict.key && sequence === conflict.sequence) last = value
+    }
+
+    return last && new RefusedChange(last, conflict)
+  }
+
+  private async reject(
+    dataset: DatasetDefinition,
+    lease: DatasetIngestLease,
+    batch: DatasetIngestBatch,
+    refused: RefusedChange
+  ): Promise<void> {
+    const { delivery, changeIndex, value } = refused.value
+    await this.inbox.reject({ lease, flushId: batch.flushId, deliveryIds: [delivery.id] })
+
+    const sequence = dataset.sequenceBy === undefined ? undefined : sequenceOf(dataset, value)
+    reportDatasetIngestRejection(this.dependencies.reporter, refused.cause, {
+      projectId: this.dependencies.projectId,
+      datasetId: dataset.id,
+      deliveryId: delivery.id,
+      executionId: delivery.executionId,
+      changeIndex,
+      key: keyOf(dataset, value),
+      ...(sequence === undefined ? {} : { sequence }),
+      failure: captureSixbFailure(refused.cause, {
+        allowedCodes: ["dataset.change_refused"],
+        defaultCode: "dataset.change_refused",
+      }),
+    })
+  }
+
+  private async announce(dataset: DatasetDefinition, committed: CommittedBatch): Promise<void> {
+    const { version, producer, deliveries } = committed
+    if (!version) return
+
+    await this.dependencies.events.emit(
+      {
+        events: [
+          {
+            type: "dataset.version.committed",
+            payload: {
+              datasetId: dataset.id,
+              versionId: version.versionId,
+              createdAt: version.createdAt.toISOString(),
+              producer,
+              rowsChanged: version.rowsChanged,
+              lineageChanged: version.lineageChanged,
+            },
+          },
+        ],
+        ...(deliveries[0] ? { correlationId: deliveries[0].correlationId } : {}),
+      },
+      { source: "SixbDatasets" }
+    )
+  }
+
+  /** The budget is spent with deliveries left: ask for the next job as `ingest` does. */
+  private async requestAgain(): Promise<void> {
+    const { request, requested } = await this.inbox.requestFlush({
+      projectId: this.dependencies.projectId,
+      datasetId: this.datasetId,
+    })
+    if (!requested) return
+
+    await this.dependencies.events.emit(
+      {
+        events: [
+          { type: "dataset.ingest.queued", payload: { datasetId: this.datasetId, request } },
+        ],
+      },
+      { source: "SixbDatasets" }
+    )
+  }
+
+  private renew(lease: DatasetIngestLease): void {
+    this.inbox.renew({ lease, leaseMs: LEASE_MS }).then(
+      (renewed) => {
+        if (renewed) return
+        this.lost.abort(
+          new DatasetIngestLeaseLostError(
+            `[Sixb] Dataset '${this.datasetId}' ingest lease was taken over by another flush.`
+          )
+        )
+      },
+      (error) => {
+        console.warn(
+          `[Sixb] Could not renew the ingest lease of dataset '${this.datasetId}'.`,
+          error
+        )
+      }
+    )
+  }
+
+  /**
+   * Settles a failed attempt. A stopping worker releases the lease, and a lost lease is its new
+   * owner's; any other failure is counted, and reported once the dataset has failed enough times
+   * in a row.
+   */
+  private async failed(lease: DatasetIngestLease, error: unknown): Promise<unknown> {
+    if (this.lost.signal.aborted) return this.lost.signal.reason
+    if (error instanceof DatasetIngestLeaseLostError) return error
+
+    if (this.signal.aborted) {
+      await this.inbox.release({ lease }).catch(() => {})
+      return error
+    }
+
+    const { failureStreak } = await this.inbox.fail({ lease })
+
+    if (failureStreak === REPORT_AT_FAILURE_STREAK) {
+      const [summary] = await this.inbox
+        .summarize({ projectId: this.dependencies.projectId, datasetIds: [this.datasetId] })
+        .catch(() => [])
+
+      reportDatasetIngestFlushFailure(this.dependencies.reporter, error, {
+        projectId: this.dependencies.projectId,
+        datasetId: this.datasetId,
+        failure: captureSixbFailure(error, {
+          allowedCodes: ["internal.unexpected", "runtime.cancelled"],
+          defaultCode: "internal.unexpected",
+        }),
+        failureStreak,
+        pendingDeliveries: summary?.pendingDeliveries ?? 0,
+        oldestReceivedAt: summary?.oldestReceivedAt?.toISOString() ?? null,
+        subject: `failed:${lease.inFlight?.flushId ?? "take"}:${lease.owner}`,
+      })
+    }
+
+    return new DatasetIngestFlushError(
+      `[Sixb] Flushing the ingested changes of dataset '${this.datasetId}' failed (${failureStreak} in a row).`,
+      failureStreak,
+      { cause: error }
+    )
+  }
+}
+
+interface BatchValue {
+  readonly value: DatasetIngestChange
+  readonly delivery: DatasetIngestDelivery
+  readonly changeIndex: number
+}
+
+/** A change of the batch the lake refuses: its delivery is dropped. */
+class RefusedChange extends Error {
+  constructor(
+    readonly value: BatchValue,
+    override readonly cause: unknown
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause })
+  }
+}
+
+function keyOf(dataset: DatasetDefinition, change: DatasetIngestChange): Record<string, string> {
+  const source = change.kind === "upsert" ? change.row : change.key
+
+  return Object.fromEntries(
+    (getDatasetPrimaryKeyColumns(dataset) ?? []).map((column) => [column, String(source[column])])
+  )
+}
+
+function sequenceOf(dataset: DatasetDefinition, change: DatasetIngestChange): string | undefined {
+  try {
+    return datasetSequenceChange(dataset, change).sequence
+  } catch {
+    // A change refused for its sequence has none to report.
+    return undefined
+  }
+}
+
+// Associates each host with its runtime, as the lake retention runtime does.
+const runtimes = new WeakMap<object, DatasetIngestRuntime>()
+
+export function registerDatasetIngestRuntime(host: object, runtime: DatasetIngestRuntime): void {
+  runtimes.set(host, runtime)
+}
+
+export function getDatasetIngestRuntime(host: object): DatasetIngestRuntime {
+  const runtime = runtimes.get(host)
+  if (!runtime) {
+    throw new Error("[Sixb] Dataset ingestion requires a configured Sixb host.")
+  }
+  return runtime
+}

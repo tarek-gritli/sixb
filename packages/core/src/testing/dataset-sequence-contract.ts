@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { InMemoryBlobStorage } from "../blob-storage"
 import { InMemoryBroker } from "../broker"
 import { change, col, type DatasetDefinition, defineDataset, type MergeChange } from "../datasets"
+import { getDatasetIngestRuntime } from "../datasets/ingest-flush"
 import { writeDataset } from "../datasets/write"
 import type { DatasetMergeCommitResult, DatasetRow, LakeStorage } from "../lake-storage"
 import { InMemoryQueues } from "../queues"
@@ -144,8 +145,9 @@ export function runDatasetSequenceContract<TStorage extends LakeStorage>(
         )
       }))
 
-    test("ingests through the bound SDK and preserves execution provenance", async () => {
+    test("ingests through the bound SDK and preserves execution and flush provenance", async () => {
       // Regression proof: remove ingest from DuckLake's producer parser; reopen loses provenance.
+      // The flush id must survive too: a flush that resumes finds its version by it.
       let storage = await options.createStorage()
       const broker = new InMemoryBroker()
       try {
@@ -160,16 +162,20 @@ export function runDatasetSequenceContract<TStorage extends LakeStorage>(
           blobStorage: new InMemoryBlobStorage(),
         })
         const sixb = createTestSixb(host)
-        const result = await sixb.datasets.ingest(dataset, { changes: [upsert(8)] })
-        expect(result.outcome).toBe("created")
+        await sixb.datasets.ingest(dataset, { changes: [upsert(8)] })
+        await getDatasetIngestRuntime(host).flush(dataset.id, new AbortController().signal)
+
+        const committed = await storage.getLatestVersion(dataset.id)
         if (options.reopen) storage = await options.reopen(storage)
         expect((await storage.getLatestVersion(dataset.id))?.producer).toEqual({
           kind: "ingest",
           id: sixb.execution.id,
+          runId: expect.stringMatching(/^flush_/),
         })
         expect((await rows(storage)).map((row) => row.name)).toEqual(["Sam"])
         expect(await host.events.read()).toMatchObject([
-          { type: "dataset.version.committed", payload: { versionId: result.version?.versionId } },
+          { type: "dataset.ingest.queued", payload: { datasetId: dataset.id } },
+          { type: "dataset.version.committed", payload: { versionId: committed?.versionId } },
         ])
       } finally {
         await options.teardown?.(storage)

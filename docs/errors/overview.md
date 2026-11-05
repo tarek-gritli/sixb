@@ -55,6 +55,7 @@ To send failures to a monitoring service, configure [onError](../logging/overvie
 | `connector.provider_unavailable` | Yes | The adapter guaranteed that a failed provider operation produced no external change. | Retry the unchanged operation later. |
 | `connector.replacement_required` | No | Account selection would replace the connection currently assigned to the slot. | Confirm replacement, then retry selection with `replace: true`, or choose another slot. |
 | `connector.revocation_pending` | Yes | Local access is disconnected, but provider revocation has not been durably confirmed. | Retry revocation; the operation is idempotent and local access remains closed. |
+| `dataset.change_refused` | No | The lake refused an ingested change when its flush wrote it, such as a source sequence another delivery holds with other content. | Send the change again with a newer source sequence. |
 | `dataset.not_found` | No | Dataset is unavailable to the caller. | Check its ID and access policy. |
 | `dataset.version_incompatible` | No | Version does not match the required dataset or schema. | Materialize a compatible version. |
 | `dataset.version_not_found` | No | Version does not exist or nothing has been committed yet. | Check the ID or materialize the dataset. |

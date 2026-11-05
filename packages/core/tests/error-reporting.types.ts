@@ -39,6 +39,8 @@ type _errorContextIsDiscriminated = Expect<
     | "rule.evaluation.failed"
     | "vector.indexing.failed"
     | "lake.retention.failed"
+    | "dataset.ingest.flush.failed"
+    | "dataset.ingest.rejected"
   >
 >
 type _errorContextAlwaysDeduplicable = Expect<Equal<SixbErrorContext["notificationId"], string>>

@@ -1,12 +1,16 @@
 import { SixbErrorReporter } from "./reporter"
 import {
   type ReportActionPhaseFailureInput,
+  type ReportDatasetIngestFlushFailureInput,
+  type ReportDatasetIngestRejectionInput,
   type ReportEventDeliveryFailureInput,
   type ReportLakeRetentionFailureInput,
   type ReportRuleEvaluationFailureInput,
   type ReportRunFailureInput,
   type ReportVectorIndexingFailureInput,
   reportActionPhaseFailure as reportActionPhaseFailureWith,
+  reportDatasetIngestFlushFailure as reportDatasetIngestFlushFailureWith,
+  reportDatasetIngestRejection as reportDatasetIngestRejectionWith,
   reportEventDeliveryFailure as reportEventDeliveryFailureWith,
   reportLakeRetentionFailure as reportLakeRetentionFailureWith,
   reportRuleEvaluationFailure as reportRuleEvaluationFailureWith,
@@ -49,6 +53,8 @@ export function shareSixbErrorReporter(source: object, target: object): void {
 
 export type {
   ReportActionPhaseFailureInput,
+  ReportDatasetIngestFlushFailureInput,
+  ReportDatasetIngestRejectionInput,
   ReportEventDeliveryFailureInput,
   ReportLakeRetentionFailureInput,
   ReportRuleEvaluationFailureInput,
@@ -106,4 +112,20 @@ export function reportLakeRetentionFailure(
   input: ReportLakeRetentionFailureInput
 ): void {
   reportLakeRetentionFailureWith(resolveSixbErrorReporter(host), error, input)
+}
+
+export function reportDatasetIngestFlushFailure(
+  host: object,
+  error: unknown,
+  input: ReportDatasetIngestFlushFailureInput
+): void {
+  reportDatasetIngestFlushFailureWith(resolveSixbErrorReporter(host), error, input)
+}
+
+export function reportDatasetIngestRejection(
+  host: object,
+  error: unknown,
+  input: ReportDatasetIngestRejectionInput
+): void {
+  reportDatasetIngestRejectionWith(resolveSixbErrorReporter(host), error, input)
 }
