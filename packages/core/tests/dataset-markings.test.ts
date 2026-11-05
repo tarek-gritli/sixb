@@ -17,7 +17,6 @@ import {
   SixbHost,
 } from "../src"
 import type { ReadDatasetRowsInput } from "../src/lake-storage"
-import { getDatasetIngestRuntime } from "../src/runtime/internal"
 import { createTestSixb } from "../src/testing"
 import { createTestRuntimeDeps } from "./test-runtime-deps"
 
@@ -64,8 +63,6 @@ async function seed() {
       change.upsert({ id: "inv-2", title: "August", amount: "80.00", customer_tax_id: null }),
     ],
   })
-  // Write the ingested changes to the lake, as the worker that flushes them would.
-  await getDatasetIngestRuntime(host).flush(rawInvoices.id, new AbortController().signal)
   const readerIn = (groupIds: readonly string[]) =>
     createTestSixb(host, {
       authorization: resolveAuthorizationContext({

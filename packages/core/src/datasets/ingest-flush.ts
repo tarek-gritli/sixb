@@ -627,6 +627,11 @@ export function registerDatasetIngestRuntime(host: object, runtime: DatasetInges
   runtimes.set(host, runtime)
 }
 
+/** The host's runtime, or undefined for a host that registered none. */
+export function findDatasetIngestRuntime(host: object): DatasetIngestRuntime | undefined {
+  return runtimes.get(host)
+}
+
 export function getDatasetIngestRuntime(host: object): DatasetIngestRuntime {
   const runtime = runtimes.get(host)
   if (!runtime) {

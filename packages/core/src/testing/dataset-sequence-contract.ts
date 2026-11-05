@@ -4,6 +4,7 @@ import { InMemoryBroker } from "../broker"
 import { change, col, type DatasetDefinition, defineDataset, type MergeChange } from "../datasets"
 import { getDatasetIngestRuntime } from "../datasets/ingest-flush"
 import { writeDataset } from "../datasets/write"
+import { createTestingScope } from "../execution/scopes"
 import {
   type DatasetMergeCommitResult,
   type DatasetRow,
@@ -171,9 +172,10 @@ export function runDatasetSequenceContract<TStorage extends LakeStorage>(
         )
       }))
 
-    test("ingests through the bound SDK and preserves execution and flush provenance", async () => {
+    test("ingests through the test SDK and preserves execution and flush provenance", async () => {
       // Regression proof: remove ingest from DuckLake's producer parser; reopen loses provenance.
-      // The flush id must survive too: a flush that resumes finds its version by it.
+      // The flush id must survive too: a flush that resumes finds its version by it. Drop
+      // \`flushIngestionInline\` from createTestSixb, and nothing is written.
       let storage = await options.createStorage()
       const broker = new InMemoryBroker()
       try {
@@ -189,7 +191,6 @@ export function runDatasetSequenceContract<TStorage extends LakeStorage>(
         })
         const sixb = createTestSixb(host)
         await sixb.datasets.ingest(dataset, { changes: [upsert(8)] })
-        await getDatasetIngestRuntime(host).flush(dataset.id, new AbortController().signal)
 
         const committed = await storage.getLatestVersion(dataset.id)
         if (options.reopen) storage = await options.reopen(storage)
@@ -223,7 +224,8 @@ export function runDatasetSequenceContract<TStorage extends LakeStorage>(
           queues: new InMemoryQueues(),
           blobStorage: new InMemoryBlobStorage(),
         })
-        const sixb = createTestSixb(host)
+        // Not the test SDK, which writes each call at once: these wait for one flush.
+        const sixb = host.withScope(createTestingScope({ projectId: host.id }))
         for (let index = 0; index < 50; index += 1) {
           await sixb.datasets.ingest(dataset, { changes: [upsert(index + 1, `Sam ${index}`)] })
         }

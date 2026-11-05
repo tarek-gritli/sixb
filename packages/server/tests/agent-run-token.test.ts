@@ -34,7 +34,6 @@ import { createInheritedAgentExecutionRecord } from "@sixb/core/internal/agent-e
 import { createAgentRunExecutionToken, createAgentRunToken } from "@sixb/core/internal/agents"
 import { emptyGrantIndex } from "@sixb/core/internal/authorization"
 import { bindRequestExecution } from "@sixb/core/internal/request-execution"
-import { getDatasetIngestRuntime } from "@sixb/core/internal/runtime"
 import type { ImageModel, LanguageModel, ModelCatalogInput } from "@sixb/core/models"
 import {
   AGENT_APPROVAL_MODES,
@@ -2130,8 +2129,6 @@ async function createRunTokenRuntime(
   await setup.datasets.ingest(deviceReadings, {
     changes: [change.upsert({ id: "fan-1", celsius: 21.5 })],
   })
-  // Write the ingested changes to the lake, as the worker that flushes them would.
-  await getDatasetIngestRuntime(sixb).flush(deviceReadings.id, new AbortController().signal)
   await setup.objects.upsert("contract", { id: "contract-1" })
   await setup.objects.upsertLink("device", "fan-1", "contract", {
     targetTypeId: "contract",

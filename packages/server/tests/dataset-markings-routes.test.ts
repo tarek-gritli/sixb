@@ -15,7 +15,6 @@ import {
   SixbHost,
 } from "@sixb/core"
 import { createAccessTokenCredential, createSessionCredential } from "@sixb/core/internal/auth"
-import { getDatasetIngestRuntime } from "@sixb/core/internal/runtime"
 import { createTestSixb } from "@sixb/core/testing"
 import { createSixbApi, SixbServer } from "../src/server"
 import { createTestBrowserPolicy } from "./helpers"
@@ -62,8 +61,6 @@ async function createApp() {
   await createTestSixb(host).datasets.ingest(rawInvoices, {
     changes: [change.upsert({ id: "inv-1", title: "July", amount: "120.00" })],
   })
-  // Write the ingested changes to the lake, as the worker that flushes them would.
-  await getDatasetIngestRuntime(host).flush(rawInvoices.id, new AbortController().signal)
   const app = createSixbApi(
     new SixbServer({ host, quiet: true, browser: createTestBrowserPolicy() })
   )

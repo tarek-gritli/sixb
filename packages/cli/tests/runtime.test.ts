@@ -34,6 +34,7 @@ import { reportEventDeliveryFailure } from "@sixb/core/internal/error-reporting"
 import { SyncRunDispatcher } from "@sixb/core/internal/syncs"
 import type { LakeMaintenance, LakeRetentionOptions } from "@sixb/core/lake-storage"
 import { createTestSixb } from "@sixb/core/testing"
+import { createTestingScope } from "../../core/src/execution/scopes"
 import {
   migrateRuntimeStorage,
   startOrchestratorRuntime,
@@ -586,7 +587,9 @@ describe("startSixbRuntime", () => {
         }
       )
 
-      await createTestSixb(sixb).datasets.ingest(people, {
+      // As a webhook handler ingests: the test SDK would write the changes itself.
+      const handler = sixb.withScope(createTestingScope({ projectId: sixb.id }))
+      await handler.datasets.ingest(people, {
         changes: [change.upsert({ id: "1", name: "Ada" })],
       })
 
