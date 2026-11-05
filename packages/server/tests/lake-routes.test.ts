@@ -123,9 +123,40 @@ describe("GET /api/lake/health", () => {
         deleteFilesAfter: "7d",
         cleanupEvery: "30m",
       },
-      datasets: [health(invoices.id)],
+      datasets: [{ ...health(invoices.id), ingest: null }],
     })
     expect(lakeStorage.described).toEqual([[invoices.id]])
+  })
+
+  // Reproduce: leave `ingest` out of the dataset rows in routes/lake.ts.
+  test("says what ingested changes wait for a flush, per dataset", async () => {
+    const { app, storage } = await createApp()
+    const headers = await seedSession(storage, "usr_staff", [staff.id])
+    const delivery = await storage.datasetIngest.append({
+      projectId,
+      datasetId: invoices.id,
+      executionId: "exec-webhook",
+      correlationId: "corr-webhook",
+      changes: [
+        { kind: "upsert", row: { id: "inv-1" } },
+        { kind: "upsert", row: { id: "inv-2" } },
+      ],
+    })
+
+    const response = await app.fetch(new Request(url, { headers }))
+
+    expect(await response.json()).toMatchObject({
+      datasets: [
+        {
+          datasetId: invoices.id,
+          ingest: {
+            pendingDeliveries: 1,
+            pendingChanges: 2,
+            oldestReceivedAt: delivery.receivedAt.toISOString(),
+          },
+        },
+      ],
+    })
   })
 
   test("asks the provider nothing when the caller may view no dataset", async () => {

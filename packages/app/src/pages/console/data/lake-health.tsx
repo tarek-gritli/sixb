@@ -1,7 +1,8 @@
 import type { GetLakeHealthResponse } from "@sixb/client"
 import { getLakeHealthOptions } from "@sixb/client/hooks"
+import { cn } from "@sixb/ui/lib/utils"
 import { useQuery } from "@tanstack/react-query"
-import { Database, HardDrive, TriangleAlert } from "lucide-react"
+import { Database, HardDrive, Inbox, TriangleAlert } from "lucide-react"
 import { Link } from "react-router-dom"
 import { SectionPage } from "../../section-page"
 import {
@@ -15,11 +16,15 @@ import {
   PanelRow,
   PanelSkeleton,
   Pill,
+  useFormat,
   useNumbers,
 } from "../../section-ui"
 import { type DataMessages, useDataMessages } from "./messages"
 
 type DatasetStorage = GetLakeHealthResponse["datasets"][number]
+
+/** Changes that waited this long mean no flush writes them: the line turns amber. */
+const STALLED_AFTER_MS = 10 * 60_000
 
 /** Console › Lake health: how each dataset is stored, and the lake's automatic cleanup. */
 export function ConsoleLakeHealthPage() {
@@ -136,6 +141,7 @@ function DatasetRow({ dataset }: { readonly dataset: DatasetStorage }) {
         dataset.materialized ? null : <Pill tone="muted">{messages.lakeHealth.notWritten}</Pill>
       }
     >
+      {dataset.ingest ? <IngestWaiting waiting={dataset.ingest} /> : null}
       {dataset.warnings.length > 0 ? (
         <ul className="flex flex-col gap-1">
           {dataset.warnings.map((warning) => (
@@ -150,6 +156,33 @@ function DatasetRow({ dataset }: { readonly dataset: DatasetStorage }) {
         </ul>
       ) : null}
     </PanelRow>
+  )
+}
+
+/** Ingested changes no flush has written yet, and how long the oldest has waited. */
+function IngestWaiting({ waiting }: { readonly waiting: NonNullable<DatasetStorage["ingest"]> }) {
+  const messages = useDataMessages().lakeHealth
+  const numbers = useNumbers()
+  const format = useFormat()
+  const stalled = Date.now() - Date.parse(waiting.oldestReceivedAt) >= STALLED_AFTER_MS
+
+  // Like a warning: one wrapping line beside its icon, so a narrow row keeps it readable.
+  return (
+    <p
+      className={cn(
+        "flex items-start gap-1.5 text-[0.8125rem] leading-5",
+        stalled ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground"
+      )}
+    >
+      <Inbox aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+      <span>
+        <span className="tabular-nums">
+          {messages.waiting(waiting.pendingChanges, numbers.count(waiting.pendingChanges))}
+        </span>
+        {" · "}
+        <span>{messages.oldest(format.relative(waiting.oldestReceivedAt))}</span>
+      </span>
+    </p>
   )
 }
 
