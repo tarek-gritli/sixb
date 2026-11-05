@@ -77,6 +77,31 @@ export function runDatasetIngestStorageContractSuite<TStorage extends DatasetIng
         ])
       }))
 
+    test("stores strings holding U+0000 and backslashes exactly, in values and JSON keys", () =>
+      withStorage(async (storage) => {
+        // Reproduce: drop the escaping in `encodeDatasetIngestChanges`; PostgreSQL's jsonb refuses
+        // the delivery, which `ingest` accepted before it had an inbox.
+        const changes: DatasetIngestChange[] = [
+          {
+            kind: "upsert",
+            row: {
+              id: "nul\u0000id",
+              name: "a\u0000b \\0 \\\\ end\\",
+              payload: { "key\u0000": ["\u0000", "\\0"], plain: "\\u0000" },
+            },
+          },
+          { kind: "delete", key: { id: "\u0000" }, sequence: "\\0" },
+        ]
+        const delivery = await append(storage, changes)
+
+        const lease = await acquire(storage, "owner-a")
+        await storage.takeBatch({ lease, flushId: "flush-1", maxChanges: 10 })
+
+        const read = await readAll(storage, lease, "flush-1")
+        expect(read.map(({ delivery }) => delivery.id)).toEqual([delivery.id])
+        expect(read[0]?.changes).toEqual(changes)
+      }))
+
     test("reads a batch past one page of deliveries", () =>
       withStorage(async (storage) => {
         // Pages hold 50 deliveries: 51 cross the boundary once.
