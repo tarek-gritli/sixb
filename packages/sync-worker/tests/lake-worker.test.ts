@@ -255,26 +255,26 @@ describe("SyncWorker lake lane", () => {
   })
 
   // Reproduce: set LAKE_CONCURRENCY to 1 in lake-worker.ts, and the flush waits behind the pass;
-  // or run `runRetention` without `retentionTail`, and the second pass starts at once.
-  test("flushes ingested changes while a retention pass runs, and runs one pass at a time", async () => {
+  // or make a retention job wait for the running pass in its slot, and the waiting ones fill
+  // every slot.
+  test("flushes ingested changes while retention runs, and runs one pass at a time", async () => {
     const { sixb, lakeStorage, queues } = createHost({ ingest: true })
     await start(sixb)
     const now = Date.now()
 
-    await enqueueRetention(queues, new Date(now - MINUTE).toISOString())
-    await enqueueRetention(queues, new Date(now).toISOString())
+    // More occurrences than slots: one runs, the others find it running and leave it the work.
+    for (let minutes = 4; minutes >= 0; minutes -= 1) {
+      await enqueueRetention(queues, new Date(now - minutes * MINUTE).toISOString())
+    }
     await eventually(() => lakeStorage.passes.length === 1)
 
     await ingestPerson(sixb, "1")
     await enqueueFlush(queues, 0)
     await eventuallyAsync(async () => (await lakeStorage.listVersions(people.id)).length === 1)
 
-    // The second pass starts only once the first is settled.
+    lakeStorage.passes[0]!.resolve()
     await eventually(() => false, 50).catch(() => {})
     expect(lakeStorage.passes).toHaveLength(1)
-    lakeStorage.passes[0]!.resolve()
-    await eventually(() => lakeStorage.passes.length === 2)
-    lakeStorage.passes[1]!.resolve()
   })
 
   // Reproduce: keep the refusal for projects without syncs or retention in SyncWorker's constructor.

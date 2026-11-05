@@ -62,8 +62,9 @@ row count, and committed `DatasetVersion`.
 retention is scheduled (`lakeMaintenance` on, a lake provider with `maintenance`, and at least one
 dataset), or a dataset can be ingested (storage with an ingest inbox, and a keyed dataset). It
 starts then even when the project has no syncs, and runs beside the sync lane, so a sync never
-delays lake work and lake work never takes a sync slot. It claims four jobs at a time, and runs
-one retention pass at a time.
+delays lake work and lake work never takes a sync slot. It claims four jobs at a time. One
+retention pass runs at a time: an occurrence that finds a pass running completes at once and
+leaves it the work, so retention never holds more than one slot.
 
 A `lake.retention.requested` job runs one occurrence of the built-in schedule:
 

@@ -21,7 +21,8 @@ const FAILURE_CODES = ["internal.unexpected", "runtime.cancelled"] as const
 
 /**
  * Four at a time, so flushes of several datasets run together and beside a retention pass, which
- * can take minutes. Retention takes at most one of them.
+ * can take minutes. Retention takes at most one of them: an occurrence that finds a pass running
+ * leaves it the work and completes at once.
  */
 const LAKE_CONCURRENCY = 4
 
@@ -58,8 +59,7 @@ export class LakeWorker extends QueueWorker<LakeQueueJob, typeof FAILURE_CODES> 
   private readonly host: LakeWorkerHost
   private readonly retention: LakeRetentionRuntime
   private readonly ingest: DatasetIngestRuntime
-  // Retention passes run one after another, so they never hold every slot.
-  private retentionTail: Promise<unknown> = Promise.resolve()
+  private retentionRunning = false
 
   constructor(host: LakeWorkerHost) {
     super({
@@ -88,13 +88,21 @@ export class LakeWorker extends QueueWorker<LakeQueueJob, typeof FAILURE_CODES> 
     }
   }
 
+  /**
+   * Runs one occurrence, unless a pass is running: that pass continues while there is more to do
+   * within its budget, and the next occurrence takes what is left.
+   */
   private async runRetention(job: LakeRetentionRequestedQueueJob, signal: AbortSignal) {
-    const run = this.retentionTail.then(() =>
-      this.retention.runOccurrence(job.payload.occurrenceAt, signal)
-    )
-    this.retentionTail = run.catch(() => undefined)
+    if (this.retentionRunning) return
 
-    const report = await run
+    this.retentionRunning = true
+    let report: LakeRetentionReport | null
+    try {
+      report = await this.retention.runOccurrence(job.payload.occurrenceAt, signal)
+    } finally {
+      this.retentionRunning = false
+    }
+
     if (report && changedAnything(report)) {
       console.info(
         `[SixbSyncWorker] Lake retention expired ${report.expiredVersions} version(s) and deleted ` +
