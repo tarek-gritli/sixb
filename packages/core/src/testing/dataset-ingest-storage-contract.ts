@@ -257,6 +257,7 @@ export function runDatasetIngestStorageContractSuite<TStorage extends DatasetIng
             request: 1,
             leaseExpiresAt: last.expiresAt,
             failureStreak: 0,
+            lastFlushedAt: expect.any(Date),
           },
         ])
       }))
@@ -277,6 +278,7 @@ export function runDatasetIngestStorageContractSuite<TStorage extends DatasetIng
             request: 0,
             leaseExpiresAt: null,
             failureStreak: 0,
+            lastFlushedAt: null,
           },
         ])
 

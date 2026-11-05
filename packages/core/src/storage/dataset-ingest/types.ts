@@ -51,6 +51,8 @@ export interface DatasetIngestSummary {
   readonly leaseExpiresAt: Date | null
   /** Flush attempts that failed in a row. */
   readonly failureStreak: number
+  /** When a flush last completed a batch of this dataset. */
+  readonly lastFlushedAt: Date | null
 }
 
 export interface AppendDatasetIngestDeliveryInput {

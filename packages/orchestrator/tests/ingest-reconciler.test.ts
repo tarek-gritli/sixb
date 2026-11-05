@@ -21,6 +21,7 @@ function summary(
     request: 0,
     leaseExpiresAt: null,
     failureStreak: 0,
+    lastFlushedAt: null,
     ...input,
   }
 }
@@ -61,8 +62,10 @@ test("queues a flush for each dataset whose deliveries wait with no flush holdin
   expect(await queuedFlushes(queues)).toEqual(["ingest-flush:crm.people:4"])
 })
 
-// Reproduce: drop the `reported` check in `reportStalled`; each pass reports again.
-test("reports a dataset whose changes wait with no flush, once per waiting delivery", async () => {
+// Reproduce: measure the stall from the oldest delivery in `reportStalled`, and the dataset a
+// flush drained 2 min ago is reported, then again with each new oldest; or drop the lease check,
+// and the dataset a flush holds is reported.
+test("reports a dataset whose changes nothing wrote for 10 minutes, once per stall", async () => {
   jest.useFakeTimers()
   const host = {}
   const reports: SixbErrorContext[] = []
@@ -70,15 +73,33 @@ test("reports a dataset whose changes wait with no flush, once per waiting deliv
     reports.push(context)
   })
 
-  const stalledSince = new Date(Date.now() - 11 * MINUTE)
+  const ago = (minutes: number) => new Date(Date.now() - minutes * MINUTE)
+  const lastFlushedAt = ago(11)
+  let pass = 0
   const inbox = {
-    summarize: async () => [
-      summary({ datasetId: "crm.people", pendingDeliveries: 3, oldestReceivedAt: stalledSince }),
-      // Flushes run and fail: the flush reports those itself.
-      summary({ datasetId: "crm.orgs", oldestReceivedAt: stalledSince, failureStreak: 2 }),
-      // Waiting, but not for long.
-      summary({ datasetId: "crm.deals", oldestReceivedAt: new Date(Date.now() - MINUTE) }),
-    ],
+    summarize: async () => {
+      pass += 1
+      return [
+        // Nothing written for 11 minutes. Its oldest delivery changes between passes, the stall
+        // does not.
+        summary({
+          datasetId: "crm.people",
+          pendingDeliveries: 3,
+          oldestReceivedAt: ago(pass === 1 ? 40 : 30),
+          lastFlushedAt,
+        }),
+        // An old backlog, but a flush completed a batch 2 minutes ago.
+        summary({ datasetId: "crm.deals", oldestReceivedAt: ago(40), lastFlushedAt: ago(2) }),
+        // A flush holds it.
+        summary({
+          datasetId: "crm.notes",
+          oldestReceivedAt: ago(40),
+          leaseExpiresAt: new Date(Date.now() + MINUTE),
+        }),
+        // Flushes run and fail: the flush reports those itself.
+        summary({ datasetId: "crm.orgs", oldestReceivedAt: ago(40), failureStreak: 2 }),
+      ]
+    },
   }
   const controller = new AbortController()
   const running = runIngestReconciler(
@@ -99,6 +120,7 @@ test("reports a dataset whose changes wait with no flush, once per waiting deliv
   await running
   await flushSixbErrors(host)
 
+  expect(pass).toBe(2)
   expect(reports).toEqual([
     expect.objectContaining({
       type: "dataset.ingest.flush.failed",
@@ -106,7 +128,7 @@ test("reports a dataset whose changes wait with no flush, once per waiting deliv
       datasetId: "crm.people",
       failureStreak: 0,
       pendingDeliveries: 3,
-      oldestReceivedAt: stalledSince.toISOString(),
+      notificationId: `dataset-ingest:${PROJECT_ID}:crm.people:stalled:${lastFlushedAt.toISOString()}`,
     }),
   ])
 })

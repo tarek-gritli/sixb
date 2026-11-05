@@ -7,6 +7,7 @@ import type {
 } from "@sixb/core/lake-storage"
 import type { ListProjectionRunsInput, ProjectionRunRecord } from "@sixb/core/storage"
 import type { ProjectionDispatcherPort, ProjectionReconciliationPorts } from "./types"
+import { waitForNextPass } from "./wait"
 
 const INTERVAL_MS = 30_000
 const STUCK_RUN_PAGE_SIZE = 100
@@ -305,17 +306,4 @@ async function findLatestDataVersion(input: {
   }
 
   return version
-}
-
-async function waitForNextPass(intervalMs: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(finish, intervalMs)
-    function finish(): void {
-      clearTimeout(timer)
-      signal.removeEventListener("abort", finish)
-      resolve()
-    }
-    signal.addEventListener("abort", finish, { once: true })
-  })
 }

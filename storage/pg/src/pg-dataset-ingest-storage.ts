@@ -37,6 +37,7 @@ interface PgStateRow {
   readonly flush_id: string | null
   readonly flush_started_at: Date | null
   readonly failure_streak: number
+  readonly last_flushed_at: Date | null
 }
 
 interface PgDeliveryRow {
@@ -68,7 +69,7 @@ class PgDatasetIngestPersistence implements DatasetIngestPersistence {
     // request committed before.
     const [row] = await this.sql<PgStateRow[]>`
       SELECT dataset_id, request::text AS request, requested, lease_owner, lease_expires_at,
-        flush_id, flush_started_at, failure_streak
+        flush_id, flush_started_at, failure_streak, last_flushed_at
       FROM dataset_ingest_state
       WHERE project_id = ${projectId} AND dataset_id = ${datasetId}
       FOR UPDATE
@@ -85,7 +86,8 @@ class PgDatasetIngestPersistence implements DatasetIngestPersistence {
         lease_expires_at = ${state.leaseExpiresAt},
         flush_id = ${state.flushId},
         flush_started_at = ${state.flushStartedAt},
-        failure_streak = ${state.failureStreak}
+        failure_streak = ${state.failureStreak},
+        last_flushed_at = ${state.lastFlushedAt}
       WHERE project_id = ${projectId} AND dataset_id = ${state.datasetId}
     `
   }
@@ -192,7 +194,7 @@ class PgDatasetIngestPersistence implements DatasetIngestPersistence {
   ): Promise<readonly DatasetIngestState[]> {
     const rows = await this.sql<PgStateRow[]>`
       SELECT dataset_id, request::text AS request, requested, lease_owner, lease_expires_at,
-        flush_id, flush_started_at, failure_streak
+        flush_id, flush_started_at, failure_streak, last_flushed_at
       FROM dataset_ingest_state
       WHERE project_id = ${projectId}
         AND (${datasetIds === undefined} OR dataset_id = ANY(${this.sql.array([...(datasetIds ?? [])])}::text[]))
@@ -238,6 +240,7 @@ function stateFromRow(row: PgStateRow): DatasetIngestState {
     flushId: row.flush_id,
     flushStartedAt: row.flush_started_at === null ? null : new Date(row.flush_started_at),
     failureStreak: row.failure_streak,
+    lastFlushedAt: row.last_flushed_at === null ? null : new Date(row.last_flushed_at),
   }
 }
 

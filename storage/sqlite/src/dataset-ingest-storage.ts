@@ -43,6 +43,7 @@ interface SqliteStateRow {
   readonly flushId: string | null
   readonly flushStartedAt: string | null
   readonly failureStreak: number
+  readonly lastFlushedAt: string | null
 }
 
 interface SqliteDeliveryRow {
@@ -57,7 +58,7 @@ interface SqliteDeliveryRow {
 const SELECT_STATE = `
   SELECT dataset_id AS datasetId, request, requested, lease_owner AS leaseOwner,
     lease_expires_at AS leaseExpiresAt, flush_id AS flushId, flush_started_at AS flushStartedAt,
-    failure_streak AS failureStreak
+    failure_streak AS failureStreak, last_flushed_at AS lastFlushedAt
   FROM dataset_ingest_state`
 
 const SELECT_DELIVERY = `
@@ -94,7 +95,7 @@ class SqliteDatasetIngestPersistence implements DatasetIngestPersistence {
       .query(
         `UPDATE dataset_ingest_state
          SET request = ?, requested = ?, lease_owner = ?, lease_expires_at = ?, flush_id = ?,
-           flush_started_at = ?, failure_streak = ?
+           flush_started_at = ?, failure_streak = ?, last_flushed_at = ?
          WHERE project_id = ? AND dataset_id = ?`
       )
       .run(
@@ -105,6 +106,7 @@ class SqliteDatasetIngestPersistence implements DatasetIngestPersistence {
         state.flushId,
         state.flushStartedAt?.toISOString() ?? null,
         state.failureStreak,
+        state.lastFlushedAt?.toISOString() ?? null,
         projectId,
         state.datasetId
       )
@@ -274,6 +276,7 @@ function stateFromRow(row: SqliteStateRow): DatasetIngestState {
     flushId: row.flushId,
     flushStartedAt: row.flushStartedAt === null ? null : new Date(row.flushStartedAt),
     failureStreak: row.failureStreak,
+    lastFlushedAt: row.lastFlushedAt === null ? null : new Date(row.lastFlushedAt),
   }
 }
 

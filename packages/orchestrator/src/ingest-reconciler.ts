@@ -3,10 +3,11 @@ import { reportDatasetIngestFlushFailure } from "@sixb/core/internal/error-repor
 import { captureSixbFailure } from "@sixb/core/internal/errors"
 import type { DatasetIngestSummary } from "@sixb/core/storage"
 import type { IngestReconciliationPorts } from "./types"
+import { waitForNextPass } from "./wait"
 
 const INTERVAL_MS = 30_000
 
-/** Changes that waited this long with no failed flush mean no flush runs for the dataset. */
+/** Deliveries waiting this long with no flush progress, and no flush running or failing, stall. */
 const STALLED_AFTER_MS = 10 * 60_000
 
 interface IngestReconcilerInput extends IngestReconciliationPorts {
@@ -21,8 +22,9 @@ interface IngestReconcilerInput extends IngestReconciliationPorts {
  * wait with no flush holding it, under the request the inbox holds, so a request the live path
  * already queued queues nothing more.
  *
- * A dataset whose oldest delivery waited for long with no failed flush is reported once: changes
- * are stored, and nothing writes them, such as in a deployment that runs no sync worker.
+ * A dataset whose deliveries waited for long with no flush holding it, failing on it or completing
+ * a batch of it is reported once per stall: changes are stored and nothing writes them, such as in
+ * a deployment that runs no sync worker.
  */
 export async function runIngestReconciler(
   input: IngestReconcilerInput,
@@ -68,18 +70,22 @@ function reportStalled(
   reported: Set<string>
 ): void {
   const oldest = summary.oldestReceivedAt
-  if (oldest === null || summary.failureStreak > 0) return
-  if (now - oldest.getTime() < STALLED_AFTER_MS) return
+  // A flush holds the dataset, or keeps failing on it and reports that itself.
+  if (oldest === null || summary.leaseExpiresAt !== null || summary.failureStreak > 0) return
 
-  // One report per delivery that waits, not one per pass.
-  const subject = `stalled:${oldest.toISOString()}`
+  // The stall starts at the last progress: the oldest delivery's arrival, or the last batch a
+  // flush completed after it. It stays the same while nothing moves, so one stall is one report.
+  const stalledSince = Math.max(oldest.getTime(), summary.lastFlushedAt?.getTime() ?? 0)
+  if (now - stalledSince < STALLED_AFTER_MS) return
+
+  const subject = `stalled:${new Date(stalledSince).toISOString()}`
   const key = `${summary.datasetId}:${subject}`
   if (reported.has(key)) return
   reported.add(key)
 
-  const minutes = Math.floor((now - oldest.getTime()) / 60_000)
+  const minutes = Math.floor((now - stalledSince) / 60_000)
   const error = new Error(
-    `[SixbOrchestrator] Dataset '${summary.datasetId}' has ${summary.pendingDeliveries} ingested delivery(ies) waiting for ${minutes} min with no flush. Run a sync worker for this project.`
+    `[SixbOrchestrator] Dataset '${summary.datasetId}' has ${summary.pendingDeliveries} ingested delivery(ies), and none was written for ${minutes} min. Run a sync worker for this project.`
   )
 
   reportDatasetIngestFlushFailure(input.reporter, error, {
@@ -113,18 +119,5 @@ export async function enqueueIngestFlush(
         metadata,
       },
     ],
-  })
-}
-
-async function waitForNextPass(intervalMs: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(finish, intervalMs)
-    function finish(): void {
-      clearTimeout(timer)
-      signal.removeEventListener("abort", finish)
-      resolve()
-    }
-    signal.addEventListener("abort", finish, { once: true })
   })
 }

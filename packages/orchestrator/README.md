@@ -65,9 +65,9 @@ SyncWorker's lake lane runs the flush.
 The event is a separate write after the delivery is stored, and direct routes are live-only, so
 the orchestrator also runs an ingest reconciler beside the projection one: on start and every 30
 seconds it reads the inbox summary and queues the same job for every dataset whose deliveries
-wait with no flush holding it. A dataset whose oldest delivery has waited 10 minutes with no
-failed flush, as when no sync worker runs, is reported once to `onError` as
-`dataset.ingest.flush.failed`.
+wait with no flush holding it. A dataset with deliveries waiting and nothing written for 10
+minutes (no flush holding it, none failing on it, no batch completed), as when no sync worker
+runs, is reported once per stall to `onError` as `dataset.ingest.flush.failed`.
 
 Projection admission has an event path and a reconciliation path:
 

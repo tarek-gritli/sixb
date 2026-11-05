@@ -25,6 +25,7 @@ export interface DatasetIngestState {
   readonly flushId: string | null
   readonly flushStartedAt: Date | null
   readonly failureStreak: number
+  readonly lastFlushedAt: Date | null
 }
 
 export interface DatasetIngestDeliveryRecord {
@@ -325,6 +326,7 @@ export class DurableDatasetIngestStorage implements DatasetIngestStorage {
         flushId: null,
         flushStartedAt: null,
         failureStreak: 0,
+        lastFlushedAt: await persistence.now(),
       })
     })
   }
@@ -413,6 +415,7 @@ export class DurableDatasetIngestStorage implements DatasetIngestStorage {
           request: state?.request ?? 0,
           leaseExpiresAt: leased ? state.leaseExpiresAt : null,
           failureStreak: state?.failureStreak ?? 0,
+          lastFlushedAt: state?.lastFlushedAt ?? null,
         }
       })
     })
@@ -443,6 +446,7 @@ export function initialDatasetIngestState(datasetId: string): DatasetIngestState
     flushId: null,
     flushStartedAt: null,
     failureStreak: 0,
+    lastFlushedAt: null,
   }
 }
 
