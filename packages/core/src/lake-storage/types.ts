@@ -1,4 +1,5 @@
 import type { DatasetDefinition, DatasetSchema } from "../datasets"
+import type { LakeMaintenance } from "./maintenance"
 import type { BeginDatasetMergeInput, LakeMergeSession } from "./merge"
 
 export type DatasetWriteMode = "snapshot" | "append"
@@ -267,6 +268,9 @@ export interface LakeStorage {
    * Iteration releases the provider connection between bounded pages, allowing other lake work.
    */
   readChanges?(input: ReadDatasetChangesInput): Promise<DatasetChanges | null>
+
+  /** Optional retention and storage description. A provider that keeps no history omits it. */
+  readonly maintenance?: LakeMaintenance
 
   /** Release external resources. Optional: a provider that owns none omits it. */
   close?(): void | Promise<void>
