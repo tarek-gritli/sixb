@@ -305,13 +305,13 @@ table, an idempotent comment update that makes any later concurrent write confli
 - a keyed append or merge, because DuckLake has no primary key and two writes of one new key
   would both commit;
 - a write into an empty dataset, because a snapshot that also read it empty would keep its rows;
-- a keyed snapshot that only added rows or only removed rows (see [Snapshot Writes](#snapshot-writes));
 - a version that changes no rows (new provenance), which also gives it a DuckLake snapshot.
 
 Each claim bumps DuckLake's catalog-wide schema version, which every connection then reloads. On
 PostgreSQL with two writers appending 100 rows each, claiming every commit cut throughput by a
 quarter to a third in our measurements, writers to two different datasets included. Snapshots that
-both insert and delete rows conflict with every concurrent change of rows and do not claim, nor do
+change rows both insert and delete some, so they conflict with every concurrent change of rows and
+do not claim: one that would only add or only remove rows also rewrites an unchanged one. Nor do
 unkeyed appends to a dataset that holds only its own columns, such as a sync target: those commit
 concurrently.
 

@@ -762,12 +762,13 @@ describe("DuckLakeStorage keyed snapshot writes", () => {
 
     const grown = [...seedRows, { id: "new1", name: "new", score: 1 }]
     const growth = await snapshot(accounts, grown)
-    expect(await feedOf(accounts, growth.versionId)).toEqual({ insert: 1 })
+    // A difference that only adds or only removes rows also rewrites an unchanged one.
+    expect(await feedOf(accounts, growth.versionId)).toEqual({ delete: 1, insert: 2 })
     expect(await sortedRows(accounts, growth.versionId)).toEqual(readRows(grown))
 
     const shrunk = grown.filter((row) => row.id !== "a7")
     const shrink = await snapshot(accounts, shrunk)
-    expect(await feedOf(accounts, shrink.versionId)).toEqual({ delete: 1 })
+    expect(await feedOf(accounts, shrink.versionId)).toEqual({ delete: 2, insert: 1 })
     expect(await sortedRows(accounts, shrink.versionId)).toEqual(readRows(shrunk))
 
     const emptied = await snapshot(accounts, [])

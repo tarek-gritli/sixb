@@ -67,7 +67,6 @@ export async function applyDatasetMergeFromRelation(
           changedTableRows: false,
           insertedRows: 0,
           deletedRows: 0,
-          keptUnchangedRows: false,
         }
       }
 
@@ -117,7 +116,6 @@ export async function applyDatasetMergeFromRelation(
         changedTableRows: true,
         insertedRows: effects.inserts + effects.updates,
         deletedRows: effects.updates + effects.deletes,
-        keptUnchangedRows: false,
       }
     }
   )

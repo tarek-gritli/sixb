@@ -819,10 +819,10 @@ export class DuckLakeWriteCoordinator {
  * - A version that changes no rows claims: it is also how it gets a snapshot.
  * - A write into an empty table claims, whatever it holds. It deletes nothing, so a snapshot that
  *   also read the table empty would delete nothing either, and keep the rows it replaces.
- * - A snapshot that replaced every row needs no claim: it inserts and deletes, from every file, so
- *   any concurrent change to the table's rows conflicts with it.
- * - A snapshot that wrote only the rows that differ needs none either when it both inserted and
- *   deleted rows, for the same reason. One that only inserted, or only deleted, claims.
+ * - A snapshot that changes rows needs no claim: it both inserts and deletes rows, so any
+ *   concurrent change to the table's rows conflicts with it. One that replaced every row does;
+ *   one that wrote only the rows that differ rewrites an unchanged row when it would only insert
+ *   or only delete (see `applyKeyedSnapshot`), rather than claim.
  * - A keyed append or merge claims. DuckLake has no primary key: two writes that insert one new
  *   key both commit unless the earlier one claims.
  * - An unkeyed append into a table with rows claims when the lineage it stores carries a
@@ -838,10 +838,7 @@ function mustClaimTable(
   }
 
   if (input.mode === "snapshot") {
-    return (
-      changeResult.keptUnchangedRows &&
-      (changeResult.insertedRows === 0 || changeResult.deletedRows === 0)
-    )
+    return false
   }
 
   return (

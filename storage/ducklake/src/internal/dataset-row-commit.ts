@@ -33,11 +33,6 @@ export interface ApplyDatasetRowsResult {
   /** Rows of the dataset table this write inserts and deletes: an updated row counts in both. */
   readonly insertedRows: number
   readonly deletedRows: number
-  /**
-   * A snapshot that wrote only the rows that differ from the table it read, and kept the others,
-   * rather than replacing every row (see `applyKeyedSnapshot`).
-   */
-  readonly keptUnchangedRows: boolean
 }
 
 /**
@@ -173,7 +168,6 @@ export async function applyDatasetRowsFromRelation(input: {
         : { kind: "exact", value: input.previousRowCount + appendedRowCount },
     insertedRows: appendedRowCount,
     deletedRows: 0,
-    keptUnchangedRows: false,
   }
 }
 
@@ -254,6 +248,28 @@ async function applyKeyedSnapshot(input: {
       })
     }
 
+    // DuckLake commits two writes that only insert concurrently, and two that only delete from
+    // different files: a difference that would only do one rewrites an unchanged row too, so
+    // that any concurrent change to the table's rows conflicts with it, as with a replacement.
+    const oneSided = insertedRows === 0 || deletedRows === 0
+    if (oneSided) {
+      const sourceKeysSql = input.primaryKeyColumns
+        .map((column) => `source.${quoteIdentifier(column)}`)
+        .join(", ")
+
+      await input.runtime.run(`
+        INSERT INTO ${delta}
+        SELECT ${sourceKeysSql}, true, true
+        FROM ${input.sourceRelationSql} source
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM ${delta} delta
+          WHERE ${primaryKeyMatchSql(input.primaryKeyColumns, "source", "delta")}
+        )
+        LIMIT 1
+      `)
+    }
+
     await input.runtime.run(`
       DELETE FROM ${input.table} AS target
       USING ${delta} AS delta
@@ -279,9 +295,8 @@ async function applyKeyedSnapshot(input: {
       resultingRowCount: { kind: "exact", value: input.sourceRowCount },
       targetWasEmpty: false,
       changedTableRows: true,
-      insertedRows,
-      deletedRows,
-      keptUnchangedRows: true,
+      insertedRows: oneSided ? insertedRows + 1 : insertedRows,
+      deletedRows: oneSided ? deletedRows + 1 : deletedRows,
     }
   } finally {
     await dropTemporaryTable(input.runtime, delta)
@@ -311,7 +326,6 @@ async function replaceRows(input: {
     changedTableRows,
     insertedRows: input.sourceRowCount,
     deletedRows: input.targetRowCount,
-    keptUnchangedRows: false,
   }
 }
 
@@ -324,7 +338,6 @@ function unchangedSnapshot(sourceRowCount: number, targetRowCount: number): Appl
     changedTableRows: false,
     insertedRows: 0,
     deletedRows: 0,
-    keptUnchangedRows: false,
   }
 }
 

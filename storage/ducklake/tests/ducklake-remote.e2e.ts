@@ -803,9 +803,9 @@ describe("DuckLakeStorage remote catalogs", () => {
     const sortedById = (rows: readonly { id: string; v: string }[]) =>
       [...rows].sort((left, right) => left.id.localeCompare(right.id))
 
-    // Regression proof: in mustClaimTable, let a snapshot that only inserted or only deleted rows
-    // commit without its claim. Two inserts never conflict, nor deletes from different files, so
-    // both snapshots commit, and the dataset holds a mix of the two.
+    // Regression proof: in applyKeyedSnapshot, stop rewriting an unchanged row for a difference
+    // that only inserts or only deletes. Two inserts never conflict, nor deletes from different
+    // files, so both snapshots commit, and the dataset holds a mix of the two.
     for (const shape of ["adds", "removes"] as const) {
       test(`two keyed snapshots that only ${shape === "adds" ? "add" : "remove"} rows do not both commit`, async () => {
         const { rows, mine } = await twoKeyedFiles(async ({ storage, other, dataset, seed }) => {
@@ -835,8 +835,8 @@ describe("DuckLakeStorage remote catalogs", () => {
       }, 60_000)
     }
 
-    // Regression proof: in mustClaimTable, claim every snapshot that kept unchanged rows. Both
-    // snapshots then bump the catalog's schema version.
+    // Regression proof: in mustClaimTable, claim every snapshot. Both snapshots then bump the
+    // catalog's schema version.
     test("keyed snapshots that update rows of different files conflict without claiming", async () => {
       const { rows, mine, bumped } = await twoKeyedFiles(
         async ({ storage, other, dataset, seed, schemaVersion }) => {
